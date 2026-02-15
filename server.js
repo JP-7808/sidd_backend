@@ -37,7 +37,7 @@ const server = http.createServer(app);
 // Socket.IO setup for Rapido-style real-time communication
 const io = new Server(server, {
   cors: {
-    origin: ["http://localhost:3000", "http://localhost:5173", process.env.FRONTEND_URL].filter(Boolean),
+    origin: ["http://localhost:3000", "http://localhost:5173", process.env.FRONTEND_URL, "https://pariyatan.com", "https://www.pariyatan.com"].filter(Boolean),
     credentials: true,
     methods: ["GET", "POST"]
   },
