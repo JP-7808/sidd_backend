@@ -41,20 +41,18 @@ const setCookies = (res, accessToken, refreshToken, user) => {
   // Access Token Cookie (short-lived)
   res.cookie('access_token', accessToken, {
     httpOnly: true,
-    secure: isProduction,
-    sameSite: isProduction ? 'none' : 'lax',
-    maxAge: 15 * 60 * 1000, // 15 minutes
-    domain: isProduction ? process.env.COOKIE_DOMAIN : undefined,
+    secure: true,
+    sameSite: "None",
+    maxAge: 15 * 60 * 1000,
     path: '/'
   });
 
   // Refresh Token Cookie (long-lived)
   res.cookie('refresh_token', refreshToken, {
     httpOnly: true,
-    secure: isProduction,
-    sameSite: isProduction ? 'none' : 'lax',
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-    domain: isProduction ? process.env.COOKIE_DOMAIN : undefined,
+    secure: true,
+    sameSite: "None",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
     path: '/'
   });
 
@@ -1578,7 +1576,7 @@ export const deleteProfileImage = async (req, res) => {
         secure: isProduction,
         sameSite: isProduction ? 'none' : 'lax',
         maxAge: 15 * 60 * 1000,
-        domain: isProduction ? process.env.COOKIE_DOMAIN : undefined,
+        domain: undefined,
         path: '/'
       });
     }
