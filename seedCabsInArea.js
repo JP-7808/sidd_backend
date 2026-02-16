@@ -8,10 +8,13 @@ dotenv.config();
 
 // DEFAULT LOCATION - Change these to your area!
 const DEFAULT_AREA = {
-  city: 'New Delhi',
-  lat: 28.6139,  // Change this to your latitude
-  lng: 77.2090   // Change this to your longitude
+  city: 'Mumbai',
+  lat: 19.0760,  // Mumbai coordinates
+  lng: 72.8777   // Mumbai coordinates
 };
+
+const RIDER_EMAIL = 'test.rider@cab.com';
+const RIDER_PHONE = '9876543210';
 
 const seedCabsInArea = async () => {
   try {
@@ -19,11 +22,17 @@ const seedCabsInArea = async () => {
     console.log('✅ Connected to MongoDB');
 
     // Create test rider for the area if doesn't exist
-    const riderEmail = `rider.${Date.now()}@test.com`;
-    const riderPhone = `98765${Math.floor(Math.random() * 100000)}`;
+    const riderEmail = RIDER_EMAIL;
+    const riderPhone = RIDER_PHONE;
     
     let rider = await Rider.findOne({ email: riderEmail });
     
+    // If not found by email, try to find any approved rider
+    if (!rider) {
+      rider = await Rider.findOne({ approvalStatus: 'APPROVED' });
+    }
+    
+    // If still not found, create new rider
     if (!rider) {
       rider = await Rider.create({
         name: `Test Rider - ${DEFAULT_AREA.city}`,
@@ -46,9 +55,40 @@ const seedCabsInArea = async () => {
         isEmailVerified: true,
         isPhoneVerified: true,
         isKYCVerified: true,
-        status: 'APPROVED'
+        status: 'APPROVED',
+        approvalStatus: 'APPROVED',
+        isOnline: true,
+        availabilityStatus: 'AVAILABLE',
+        currentLocation: {
+          type: 'Point',
+          coordinates: [DEFAULT_AREA.lng, DEFAULT_AREA.lat]
+        },
+        isLocked: false
       });
       console.log(`✅ Created rider: ${rider.name}`);
+    } else {
+      rider.name = `Test Rider - ${DEFAULT_AREA.city}`;
+      rider.isOnline = true;
+      rider.availabilityStatus = 'AVAILABLE';
+      rider.approvalStatus = 'APPROVED';
+      rider.status = 'APPROVED';
+      rider.homeAddress = {
+        addressLine: `Main Street, ${DEFAULT_AREA.city}`,
+        city: DEFAULT_AREA.city,
+        state: DEFAULT_AREA.city,
+        pincode: '110001',
+        location: {
+          lat: DEFAULT_AREA.lat,
+          lng: DEFAULT_AREA.lng
+        }
+      };
+      rider.currentLocation = {
+        type: 'Point',
+        coordinates: [DEFAULT_AREA.lng, DEFAULT_AREA.lat]
+      };
+      rider.isLocked = false;
+      await rider.save();
+      console.log(`✅ Updated rider: ${rider.name} to ${DEFAULT_AREA.city}`);
     }
 
     // Create 3 cabs in the area

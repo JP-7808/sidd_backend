@@ -7,6 +7,7 @@ import {
   suspendRider,
   getCabs,
   approveCab,
+  createCab,
   getPricing,
   updatePricing,
   getBookings,
@@ -36,6 +37,7 @@ router.put('/riders/:id/suspend', suspendRider);
 
 // Cab Management
 router.get('/cabs', getCabs);
+router.post('/cabs', createCab);
 router.put('/cabs/:id/approve', approveCab);
 
 // Pricing Management

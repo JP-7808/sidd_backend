@@ -26,7 +26,7 @@ const deg2rad = (deg) => {
 // Search nearby cabs
 export const searchNearbyCabs = async (req, res) => {
   try {
-    const { lat, lng, cabType, maxDistance = 5 } = req.query;
+    const { lat, lng, cabType, maxDistance = 50 } = req.query;
 
     console.log('🔍 Search nearby cabs called:', { lat, lng, cabType, maxDistance });
 
@@ -37,7 +37,6 @@ export const searchNearbyCabs = async (req, res) => {
       });
     }
 
-    // Parse and validate coordinates
     const parsedLat = parseFloat(lat);
     const parsedLng = parseFloat(lng);
     
@@ -48,68 +47,30 @@ export const searchNearbyCabs = async (req, res) => {
       });
     }
 
-    const query = {
-      isOnline: true,
-      isLocked: false, // ADD THIS - riders shouldn't be locked
-      approvalStatus: 'APPROVED',
-      // Remove availabilityStatus filter temporarily for debugging
-      availabilityStatus: 'AVAILABLE',
-    };
+    // SIMPLE QUERY - Get all approved and available cabs
+    let cabs = await Cab.find({
+      isApproved: true,
+      isAvailable: true
+    })
+    .select('cabType cabModel cabNumber seatingCapacity acAvailable riderId')
+    .limit(50);
 
-    console.log('📋 Rider query:', query);
+    console.log(`🚗 Found ${cabs.length} total cabs in database`);
 
-    // Find riders within distance
-    let riders = [];
-    
-    // First try with geo query
-    try {
-      riders = await Rider.find({
-        ...query,
-        currentLocation: {
-          $near: {
-            $geometry: {
-              type: 'Point',
-              coordinates: [parsedLng, parsedLat]
-            },
-            $maxDistance: maxDistance * 1000 // Convert to meters
-          }
-        }
-      })
-      .select('name photo currentLocation overallRating totalRatings completedRides')
-      .limit(50);
-      
-      console.log(`📍 Found ${riders.length} riders with geo query`);
-    } catch (geoError) {
-      console.warn('⚠️ Geo query failed, falling back to simple query:', geoError.message);
-      
-      // Fallback: Get all online approved riders
-      riders = await Rider.find(query)
-        .select('name photo currentLocation overallRating totalRatings completedRides')
-        .limit(20);
-    }
-
-    // Get cab details for riders
-    const riderIds = riders.map(r => r._id);
-    const cabQuery = { 
-      riderId: { $in: riderIds },
-      isApproved: true // Use isApproved field that exists in Cab model
-    };
-    
-    if (cabType) {
-      cabQuery.cabType = cabType;
-    }
-
-    console.log('📋 Cab query:', cabQuery);
-
-    const cabs = await Cab.find(cabQuery)
-      .select('cabType cabModel cabNumber seatingCapacity acAvailable riderId');
-
-    console.log(`🚗 Found ${cabs.length} cabs`);
+    // Get rider details for each cab
+    const riderIds = cabs.map(c => c.riderId);
+    const riders = await Rider.find({ _id: { $in: riderIds } })
+      .select('name photo currentLocation overallRating totalRatings completedRides');
 
     // Combine rider and cab data
-    const availableCabs = riders.map(rider => {
-      const cab = cabs.find(c => c.riderId && c.riderId.toString() === rider._id.toString());
-      if (!cab) return null;
+    const riderMap = {};
+    riders.forEach(r => {
+      riderMap[r._id.toString()] = r;
+    });
+
+    const availableCabs = cabs.map(cab => {
+      const rider = riderMap[cab.riderId?.toString()];
+      if (!rider) return null;
 
       // Calculate distance
       let distance = 0;
@@ -147,11 +108,9 @@ export const searchNearbyCabs = async (req, res) => {
           seatingCapacity: cab.seatingCapacity,
           acAvailable: cab.acAvailable
         },
-        estimatedArrival: Math.max(3, Math.round((distance / 30) * 60)) // minutes at 30 km/h, min 3 minutes
+        estimatedArrival: Math.max(3, Math.round((distance / 30) * 60))
       };
     }).filter(cab => cab !== null);
-
-    console.log(`✅ Available cabs: ${availableCabs.length}`);
 
     // Sort by distance
     availableCabs.sort((a, b) => a.rider.distance - b.rider.distance);
@@ -165,6 +124,8 @@ export const searchNearbyCabs = async (req, res) => {
       acc[type].push(cab);
       return acc;
     }, {});
+
+    console.log(`✅ Available cabs: ${availableCabs.length}`);
 
     res.status(200).json({
       success: true,
@@ -182,7 +143,6 @@ export const searchNearbyCabs = async (req, res) => {
     console.error('❌ Search nearby cabs error:', error);
     console.error('🔍 Error stack:', error.stack);
     
-    // Return error details for debugging
     res.status(500).json({
       success: false,
       message: error.message || 'Failed to search nearby cabs',

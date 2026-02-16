@@ -537,6 +537,63 @@ export const approveCab = async (req, res) => {
   }
 };
 
+// Create a new cab (admin can add cabs dynamically)
+export const createCab = async (req, res) => {
+  try {
+    const { riderId, cabType, cabNumber, cabModel, seatingCapacity, acAvailable } = req.body;
+
+    if (!riderId || !cabType || !cabNumber || !cabModel) {
+      return res.status(400).json({
+        success: false,
+        message: 'riderId, cabType, cabNumber, and cabModel are required'
+      });
+    }
+
+    const rider = await Rider.findById(riderId);
+    if (!rider) {
+      return res.status(404).json({
+        success: false,
+        message: 'Rider not found'
+      });
+    }
+
+    const existingCab = await Cab.findOne({ cabNumber: cabNumber.toUpperCase() });
+    if (existingCab) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cab with this number already exists'
+      });
+    }
+
+    const cab = await Cab.create({
+      riderId,
+      cabType,
+      cabNumber: cabNumber.toUpperCase(),
+      cabModel,
+      seatingCapacity: seatingCapacity || 5,
+      acAvailable: acAvailable !== false,
+      isApproved: true,
+      isAvailable: true,
+      approvalStatus: 'APPROVED',
+      approvedAt: new Date()
+    });
+
+    await cab.populate('riderId', 'name email phone');
+
+    res.status(201).json({
+      success: true,
+      message: 'Cab created successfully',
+      data: cab
+    });
+  } catch (error) {
+    console.error('Create cab error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create cab'
+    });
+  }
+};
+
 // Manage Pricing
 export const getPricing = async (req, res) => {
   try {
