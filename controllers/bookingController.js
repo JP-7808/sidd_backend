@@ -195,6 +195,22 @@ export const createBooking = async (req, res) => {
       });
     }
 
+    // Validate scheduled booking
+    if (bookingType === 'SCHEDULED' && !scheduledAt) {
+      return res.status(400).json({
+        success: false,
+        message: 'Scheduled time is required for scheduled bookings'
+      });
+    }
+
+    // Validate scheduled time is in future
+    if (bookingType === 'SCHEDULED' && new Date(scheduledAt) < new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Scheduled time must be in the future'
+      });
+    }
+
     // Get user details
     const User = mongoose.model('User');
     const user = await User.findById(userId).session(session);
@@ -237,9 +253,12 @@ export const createBooking = async (req, res) => {
     };
     
     const otp = generateOTP();
-    const otpExpiresAt = new Date(Date.now() + 30 * 60 * 1000);
+    // const otpExpiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
-    // Create booking with INITIATED status
+    // Set booking status based on type
+    const initialStatus = bookingType === 'SCHEDULED' ? 'SCHEDULED' : 'INITIATED';
+
+    // Create booking
     const Booking = mongoose.model('Booking');
     
     const bookingData = {
@@ -252,9 +271,9 @@ export const createBooking = async (req, res) => {
       distanceKm: distanceKm || 0,
       estimatedFare: estimatedFare || 0,
       paymentMethod,
-      bookingStatus: 'INITIATED', // Start with INITIATED
+      bookingStatus: initialStatus,
       otp,
-      otpExpiresAt,
+      // otpExpiresAt,
       broadcastRetryCount: 0,
       isBroadcastActive: false,
       broadcastedTo: []
@@ -263,7 +282,7 @@ export const createBooking = async (req, res) => {
     const booking = new Booking(bookingData);
     await booking.save({ session });
 
-    // Create payment record (PENDING)
+    // Create payment record
     const Payment = mongoose.model('Payment');
     const payment = new Payment({
       bookingId: booking._id,
@@ -283,35 +302,34 @@ export const createBooking = async (req, res) => {
       bookingId: booking._id,
       type: 'BOOKING_CREATED',
       title: 'Booking Created',
-      message: `Your booking has been created. Searching for nearby drivers...`,
-      data: { bookingId: booking._id }
+      message: bookingType === 'SCHEDULED' 
+        ? `Your scheduled booking has been created. Searching for drivers...`
+        : `Your booking has been created. Searching for nearby drivers...`,
+      data: { bookingId: booking._id, bookingType }
     });
     await notification.save({ session });
 
     await session.commitTransaction();
 
-    // IMPORTANT: Immediately start broadcasting to nearby riders
+    // IMPORTANT: Start broadcasting for ALL booking types (both IMMEDIATE and SCHEDULED)
     let broadcastResult = { success: false, message: 'Broadcast not started', count: 0 };
     
-    if (bookingType === 'IMMEDIATE') {
-      console.log('🚀 Starting broadcast for immediate booking:', booking._id);
-      
-      // Call the broadcast function - make sure to pass the io instance from app
-      broadcastResult = await broadcastToNearbyRiders(booking._id, req.app.get('io'));
-      
-      console.log('📢 Broadcast result:', broadcastResult);
-    } else {
-      console.log('📅 Scheduled booking - will broadcast later:', booking._id);
-      // For scheduled bookings, you might want to schedule the broadcast
-    }
+    console.log(`🚀 Starting broadcast for ${bookingType} booking:`, booking._id);
+    
+    // Call the broadcast function for ALL bookings
+    broadcastResult = await broadcastToNearbyRiders(booking._id, req.app.get('io'), bookingType);
+    
+    console.log('📢 Broadcast result:', broadcastResult);
 
     res.status(201).json({
       success: true,
-      message: 'Booking created successfully. Searching for nearby drivers...',
+      message: bookingType === 'SCHEDULED'
+        ? 'Scheduled booking created successfully. Searching for drivers...'
+        : 'Booking created successfully. Searching for nearby drivers...',
       data: {
         booking,
         broadcastResult,
-        status: 'SEARCHING_DRIVER'
+        status: bookingType === 'SCHEDULED' ? 'SCHEDULED' : 'SEARCHING_DRIVER'
       }
     });
 
@@ -331,18 +349,21 @@ export const createBooking = async (req, res) => {
 // Enhanced broadcast function
 // controllers/bookingController.js - Fix broadcastToNearbyRiders function
 
-export const broadcastToNearbyRiders = async (bookingId, io) => {
+// controllers/bookingController.js - Updated broadcast function for scheduled bookings
+
+export const broadcastToNearbyRiders = async (bookingId, io, bookingType = 'IMMEDIATE') => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
-    console.log('📢 Starting broadcast for booking:', bookingId);
+    console.log(`📢 Starting broadcast for ${bookingType} booking:`, bookingId);
     
     const Booking = mongoose.model('Booking');
     const Rider = mongoose.model('Rider');
     const Cab = mongoose.model('Cab');
     const BookingRequest = mongoose.model('BookingRequest');
     const Notification = mongoose.model('Notification');
+    const User = mongoose.model('User');
 
     const booking = await Booking.findById(bookingId).session(session);
     
@@ -354,13 +375,21 @@ export const broadcastToNearbyRiders = async (bookingId, io) => {
     console.log('📦 Booking details:', {
       id: booking._id,
       vehicleType: booking.vehicleType,
+      bookingType: booking.bookingType,
+      scheduledAt: booking.scheduledAt,
       pickup: booking.pickup?.addressText,
       coordinates: booking.pickup?.location?.coordinates
     });
 
-    // Update booking status to SEARCHING_DRIVER
-    booking.bookingStatus = 'SEARCHING_DRIVER';
-    booking.isBroadcastActive = true;
+    // Update booking status based on type
+    if (booking.bookingType === 'SCHEDULED') {
+      // For scheduled bookings, keep as SCHEDULED but mark broadcast as active
+      booking.isBroadcastActive = true;
+    } else {
+      // For immediate bookings, update to SEARCHING_DRIVER
+      booking.bookingStatus = 'SEARCHING_DRIVER';
+      booking.isBroadcastActive = true;
+    }
     await booking.save({ session });
 
     // Find all cabs of the requested vehicle type
@@ -375,9 +404,24 @@ export const broadcastToNearbyRiders = async (bookingId, io) => {
     if (cabs.length === 0) {
       console.log('❌ No cabs found for vehicle type:', booking.vehicleType);
       
-      booking.bookingStatus = 'NO_DRIVER_FOUND';
+      if (booking.bookingType !== 'SCHEDULED') {
+        booking.bookingStatus = 'NO_DRIVER_FOUND';
+      }
       booking.isBroadcastActive = false;
       await booking.save({ session });
+      
+      // Notify user
+      const notification = new Notification({
+        userId: booking.userId,
+        bookingId: booking._id,
+        type: 'NO_DRIVER_FOUND',
+        title: 'No Drivers Available',
+        message: booking.bookingType === 'SCHEDULED'
+          ? 'Sorry, no drivers are available for your scheduled time. Please try a different time.'
+          : 'Sorry, no drivers are available at the moment. Please try again.',
+        data: { bookingId: booking._id }
+      });
+      await notification.save({ session });
       
       await session.commitTransaction();
       
@@ -389,17 +433,19 @@ export const broadcastToNearbyRiders = async (bookingId, io) => {
     }
 
     const riderIds = cabs.map(cab => cab.riderId);
-    console.log('👤 Potential rider IDs:', riderIds);
+    console.log('👤 All riders with matching cabs:', riderIds);
 
-    // Find nearby available riders (within 10km)
+    // Find ALL riders with matching cabs within range
     const [lng, lat] = booking.pickup.location.coordinates;
     
     console.log('📍 Search coordinates:', { lat, lng });
     
+    // For scheduled bookings, use larger radius (50km) since riders have time to travel
+    const searchRadius = booking.bookingType === 'SCHEDULED' ? 50000 : 30000; // 50km for scheduled, 30km for immediate
+    
+    // Find all eligible riders (online/offline) within radius
     const nearbyRiders = await Rider.find({
       _id: { $in: riderIds },
-      isOnline: true,
-      availabilityStatus: 'AVAILABLE',
       approvalStatus: 'APPROVED',
       isActive: true,
       currentLocation: {
@@ -408,18 +454,24 @@ export const broadcastToNearbyRiders = async (bookingId, io) => {
             type: 'Point',
             coordinates: [lng, lat]
           },
-          $maxDistance: 30000 // 30km radius
+          $maxDistance: searchRadius
         }
       }
-    }).select('_id name');
+    }).select('_id name isOnline availabilityStatus');
 
-    console.log(`📍 Found ${nearbyRiders.length} nearby available riders:`, 
-      nearbyRiders.map(r => ({ id: r._id, name: r.name })));
+    console.log(`📍 Found ${nearbyRiders.length} eligible riders within ${searchRadius/1000}km:`, 
+      nearbyRiders.map(r => ({ 
+        id: r._id, 
+        name: r.name, 
+        status: r.isOnline ? 'ONLINE' : 'OFFLINE' 
+      })));
 
     if (nearbyRiders.length === 0) {
-      console.log('❌ No nearby riders found');
+      console.log('❌ No riders found within range');
       
-      booking.bookingStatus = 'NO_DRIVER_FOUND';
+      if (booking.bookingType !== 'SCHEDULED') {
+        booking.bookingStatus = 'NO_DRIVER_FOUND';
+      }
       booking.isBroadcastActive = false;
       await booking.save({ session });
       
@@ -429,7 +481,9 @@ export const broadcastToNearbyRiders = async (bookingId, io) => {
         bookingId: booking._id,
         type: 'NO_DRIVER_FOUND',
         title: 'No Drivers Available',
-        message: 'Sorry, no drivers are available at the moment. Please try again.',
+        message: booking.bookingType === 'SCHEDULED'
+          ? 'Sorry, no drivers are available in your area for the scheduled time.'
+          : 'Sorry, no drivers are available in your area. Please try again.',
         data: { bookingId: booking._id }
       });
       await notification.save({ session });
@@ -444,7 +498,11 @@ export const broadcastToNearbyRiders = async (bookingId, io) => {
     }
 
     const riderIdList = nearbyRiders.map(r => r._id);
-    const expiresAt = new Date(Date.now() + 900 * 1000); // 90 seconds
+    
+    // Set different expiry times based on booking type
+    // Scheduled bookings: 30 minutes to respond
+    // Immediate bookings: 90 seconds to respond
+    const expiresAt = new Date(Date.now() + (booking.bookingType === 'SCHEDULED' ? 30 * 60 * 1000 : 90 * 1000));
 
     // Create booking requests for each rider
     const bookingRequests = [];
@@ -460,14 +518,16 @@ export const broadcastToNearbyRiders = async (bookingId, io) => {
           bookingId: booking._id,
           riderId,
           status: 'PENDING',
-          expiresAt
+          expiresAt,
+          bookingType: booking.bookingType, // Store booking type in request
+          scheduledAt: booking.scheduledAt
         });
       }
     }
 
     if (bookingRequests.length > 0) {
       await BookingRequest.insertMany(bookingRequests, { session });
-      console.log(`✅ Created ${bookingRequests.length} booking requests`);
+      console.log(`✅ Created ${bookingRequests.length} booking requests (expires in ${booking.bookingType === 'SCHEDULED' ? '30 minutes' : '90 seconds'})`);
     }
 
     // Update booking
@@ -478,10 +538,15 @@ export const broadcastToNearbyRiders = async (bookingId, io) => {
 
     await session.commitTransaction();
 
-    // Emit socket events to riders
+    // Get user details for the notification
+    const user = await User.findById(booking.userId).select('name');
+
+    // Emit socket events to online riders
     if (io) {
       const bookingData = {
         bookingId: booking._id,
+        bookingType: booking.bookingType,
+        scheduledAt: booking.scheduledAt,
         pickup: {
           addressText: booking.pickup.addressText,
           location: booking.pickup.location.coordinates,
@@ -497,21 +562,36 @@ export const broadcastToNearbyRiders = async (bookingId, io) => {
         estimatedFare: booking.estimatedFare,
         vehicleType: booking.vehicleType,
         expiresAt,
-        customerName: (await User.findById(booking.userId))?.name || 'Customer'
+        customerName: user?.name || 'Customer',
+        createdAt: booking.createdAt,
+        message: booking.bookingType === 'SCHEDULED'
+          ? `Scheduled ride for ${new Date(booking.scheduledAt).toLocaleString()}`
+          : 'Immediate ride request'
       };
 
-      console.log(`📡 Broadcasting to ${riderIdList.length} riders via socket`);
+      // Only emit to online riders
+      const onlineRiderIds = nearbyRiders
+        .filter(r => r.isOnline)
+        .map(r => r._id);
+
+      console.log(`📡 Broadcasting to ${onlineRiderIds.length} online riders via socket`);
       
-      riderIdList.forEach(riderId => {
+      onlineRiderIds.forEach(riderId => {
         console.log(`  → Emitting to rider-${riderId}`);
         io.to(`rider-${riderId}`).emit('new-booking-request', bookingData);
       });
+
+      console.log(`💾 Requests saved for ${nearbyRiders.length - onlineRiderIds.length} offline riders`);
     }
 
     return { 
       success: true, 
       message: 'Booking broadcasted successfully',
-      count: riderIdList.length
+      count: nearbyRiders.length,
+      onlineCount: nearbyRiders.filter(r => r.isOnline).length,
+      offlineCount: nearbyRiders.filter(r => !r.isOnline).length,
+      bookingType: booking.bookingType,
+      expiresIn: booking.bookingType === 'SCHEDULED' ? '30 minutes' : '90 seconds'
     };
   } catch (error) {
     await session.abortTransaction();
@@ -1109,12 +1189,12 @@ export const verifyOtpAndStartTrip = async (req, res) => {
       });
     }
 
-    if (new Date() > booking.otpExpiresAt) {
-      return res.status(400).json({
-        success: false,
-        message: 'OTP has expired'
-      });
-    }
+    // if (new Date() > booking.otpExpiresAt) {
+    //   return res.status(400).json({
+    //     success: false,
+    //     message: 'OTP has expired'
+    //   });
+    // }
 
     booking.bookingStatus = 'TRIP_STARTED';
     booking.otpVerifiedAt = new Date();

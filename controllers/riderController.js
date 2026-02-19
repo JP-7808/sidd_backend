@@ -356,7 +356,8 @@ export const getAvailableBookings = async (req, res) => {
     console.log(`Found ${pendingRequests.length} pending requests:`, 
       pendingRequests.map(r => ({ 
         bookingId: r.bookingId, 
-        expiresAt: r.expiresAt 
+        expiresAt: r.expiresAt,
+        bookingType: r.bookingType
       }))
     );
 
@@ -370,22 +371,24 @@ export const getAvailableBookings = async (req, res) => {
       });
     }
 
-    // 2. Get the actual bookings with populated user data
+    // 2. Get the actual bookings - INCLUDE SCHEDULED status!
+    // For scheduled bookings, we want to show them even though they're not SEARCHING_DRIVER yet
     console.log('Looking for bookings with IDs:', bookingIds);
-    console.log('Booking status filter:', ['INITIATED', 'SEARCHING_DRIVER']);
+    console.log('Booking status filter:', ['INITIATED', 'SEARCHING_DRIVER', 'SCHEDULED']);
 
     const bookings = await Booking.find({
       _id: { $in: bookingIds },
-      bookingStatus: { $in: ['INITIATED', 'SEARCHING_DRIVER'] }
+      bookingStatus: { $in: ['INITIATED', 'SEARCHING_DRIVER', 'SCHEDULED'] }
     })
     .populate('userId', 'name phone rating')
-    .select('pickup drop vehicleType distanceKm estimatedFare bookingStatus createdAt userId');
+    .select('pickup drop vehicleType distanceKm estimatedFare bookingStatus createdAt userId bookingType scheduledAt');
 
     console.log(`Found ${bookings.length} matching bookings:`, 
       bookings.map(b => ({ 
         id: b._id, 
         status: b.bookingStatus,
-        vehicleType: b.vehicleType 
+        vehicleType: b.vehicleType,
+        bookingType: b.bookingType
       }))
     );
 
@@ -393,10 +396,10 @@ export const getAvailableBookings = async (req, res) => {
     if (bookings.length === 0) {
       const allBookings = await Booking.find({
         _id: { $in: bookingIds }
-      }).select('_id bookingStatus');
+      }).select('_id bookingStatus bookingType');
       
       console.log('All bookings (regardless of status):', 
-        allBookings.map(b => ({ id: b._id, status: b.bookingStatus }))
+        allBookings.map(b => ({ id: b._id, status: b.bookingStatus, type: b.bookingType }))
       );
     }
 
@@ -414,8 +417,11 @@ export const getAvailableBookings = async (req, res) => {
         distanceKm: booking.distanceKm || 0,
         estimatedFare: booking.estimatedFare || 0,
         bookingStatus: booking.bookingStatus,
+        bookingType: booking.bookingType || 'IMMEDIATE',
+        scheduledAt: booking.scheduledAt,
         createdAt: booking.createdAt,
-        customer: booking.userId ? {
+        userId: booking.userId ? {
+          _id: booking.userId._id,
           name: booking.userId.name || 'Customer',
           phone: booking.userId.phone,
           rating: booking.userId.rating || 4.5
@@ -448,8 +454,6 @@ export const getAvailableBookings = async (req, res) => {
 // Accept booking request - UPDATED VERSION
 // controllers/riderController.js - Updated acceptBookingRequest
 
-// controllers/riderController.js - Fixed acceptBookingRequest
-
 export const acceptBookingRequest = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -460,31 +464,17 @@ export const acceptBookingRequest = async (req, res) => {
 
     console.log('========== ACCEPT BOOKING REQUEST ==========');
     console.log('1. Request received:', { bookingId, riderId });
-    console.log('2. Request body:', req.body);
-    console.log('3. User:', req.user);
 
     // Validate bookingId
-    if (!bookingId) {
-      console.log('❌ ERROR: Booking ID is missing');
+    if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId)) {
       await session.abortTransaction();
       return res.status(400).json({
         success: false,
-        message: 'Booking ID is required'
-      });
-    }
-
-    // Validate MongoDB ObjectId
-    if (!mongoose.Types.ObjectId.isValid(bookingId)) {
-      console.log('❌ ERROR: Invalid Booking ID format:', bookingId);
-      await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid booking ID format'
+        message: 'Invalid booking ID'
       });
     }
 
     // 1. Find the booking request
-    console.log('4. Looking for booking request...');
     const bookingRequest = await BookingRequest.findOne({
       bookingId,
       riderId,
@@ -492,19 +482,7 @@ export const acceptBookingRequest = async (req, res) => {
     }).session(session);
 
     if (!bookingRequest) {
-      console.log('❌ ERROR: No pending booking request found');
-      console.log('   - Searched for:', { bookingId, riderId, status: 'PENDING' });
-      
-      // Check if request exists with different status
-      const otherRequest = await BookingRequest.findOne({
-        bookingId,
-        riderId
-      }).session(session);
-      
-      if (otherRequest) {
-        console.log('   - Found request with different status:', otherRequest.status);
-      }
-      
+      console.log('❌ No pending booking request found');
       await session.abortTransaction();
       return res.status(404).json({
         success: false,
@@ -512,23 +490,20 @@ export const acceptBookingRequest = async (req, res) => {
       });
     }
 
-    console.log('5. Found booking request:', {
+    console.log('2. Found booking request:', {
       id: bookingRequest._id,
       status: bookingRequest.status,
-      expiresAt: bookingRequest.expiresAt
+      expiresAt: bookingRequest.expiresAt,
+      bookingType: bookingRequest.bookingType
     });
 
     // 2. Check if request has expired
     const now = new Date();
     if (now > bookingRequest.expiresAt) {
-      console.log('❌ ERROR: Booking request expired');
-      console.log('   - Expires at:', bookingRequest.expiresAt);
-      console.log('   - Current time:', now);
-      
+      console.log('❌ Booking request expired');
       bookingRequest.status = 'EXPIRED';
       await bookingRequest.save({ session });
       await session.commitTransaction();
-      
       return res.status(400).json({
         success: false,
         message: 'Booking request has expired'
@@ -536,11 +511,10 @@ export const acceptBookingRequest = async (req, res) => {
     }
 
     // 3. Get the booking details
-    console.log('6. Looking for booking:', bookingId);
     const booking = await Booking.findById(bookingId).session(session);
     
     if (!booking) {
-      console.log('❌ ERROR: Booking not found');
+      console.log('❌ Booking not found');
       await session.abortTransaction();
       return res.status(404).json({
         success: false,
@@ -548,17 +522,21 @@ export const acceptBookingRequest = async (req, res) => {
       });
     }
 
-    console.log('7. Found booking:', {
+    console.log('3. Found booking:', {
       id: booking._id,
       status: booking.bookingStatus,
       vehicleType: booking.vehicleType,
+      bookingType: booking.bookingType,
       hasRider: !!booking.riderId,
       userId: booking.userId
     });
 
     // 4. Check if booking is still available
-    if (!['INITIATED', 'SEARCHING_DRIVER'].includes(booking.bookingStatus)) {
-      console.log(`❌ ERROR: Booking cannot be accepted. Current status: ${booking.bookingStatus}`);
+    // Allow acceptance for: INITIATED, SEARCHING_DRIVER, and SCHEDULED
+    const allowedStatuses = ['INITIATED', 'SEARCHING_DRIVER', 'SCHEDULED'];
+    
+    if (!allowedStatuses.includes(booking.bookingStatus)) {
+      console.log(`❌ Booking cannot be accepted. Current status: ${booking.bookingStatus}`);
       await session.abortTransaction();
       return res.status(400).json({
         success: false,
@@ -567,7 +545,7 @@ export const acceptBookingRequest = async (req, res) => {
     }
 
     if (booking.riderId) {
-      console.log('❌ ERROR: Booking already has a rider assigned:', booking.riderId);
+      console.log('❌ Booking already has a rider assigned:', booking.riderId);
       await session.abortTransaction();
       return res.status(400).json({
         success: false,
@@ -576,10 +554,6 @@ export const acceptBookingRequest = async (req, res) => {
     }
 
     // 5. Get rider's cab
-    console.log('8. Looking for rider\'s cab...');
-    console.log('   - Rider ID:', riderId);
-    console.log('   - Vehicle Type:', booking.vehicleType);
-    
     const cab = await Cab.findOne({ 
       riderId, 
       cabType: booking.vehicleType,
@@ -588,20 +562,7 @@ export const acceptBookingRequest = async (req, res) => {
     }).session(session);
 
     if (!cab) {
-      console.log('❌ ERROR: No available cab found for vehicle type:', booking.vehicleType);
-      
-      // Check if rider has any cab at all
-      const anyCab = await Cab.findOne({ riderId }).session(session);
-      if (anyCab) {
-        console.log('   - Rider has cab but with issues:', {
-          cabType: anyCab.cabType,
-          isApproved: anyCab.isApproved,
-          isAvailable: anyCab.isAvailable
-        });
-      } else {
-        console.log('   - Rider has no cab registered');
-      }
-      
+      console.log('❌ No available cab found for vehicle type:', booking.vehicleType);
       await session.abortTransaction();
       return res.status(400).json({
         success: false,
@@ -609,23 +570,20 @@ export const acceptBookingRequest = async (req, res) => {
       });
     }
 
-    console.log('9. Found cab:', {
+    console.log('4. Found cab:', {
       id: cab._id,
       cabNumber: cab.cabNumber,
-      cabType: cab.cabType,
-      isApproved: cab.isApproved,
-      isAvailable: cab.isAvailable
+      cabType: cab.cabType
     });
 
     // 6. Check if rider is already on another trip
-    console.log('10. Checking for existing active trips...');
     const existingTrip = await Booking.findOne({
       riderId,
       bookingStatus: { $in: ['DRIVER_ASSIGNED', 'DRIVER_ARRIVED', 'TRIP_STARTED'] }
     }).session(session);
 
     if (existingTrip) {
-      console.log('❌ ERROR: Rider already has an active trip:', existingTrip._id);
+      console.log('❌ Rider already has an active trip:', existingTrip._id);
       await session.abortTransaction();
       return res.status(400).json({
         success: false,
@@ -633,27 +591,24 @@ export const acceptBookingRequest = async (req, res) => {
       });
     }
 
-    console.log('11. No existing active trips found');
-
     // 7. Update booking with rider and cab details
-    console.log('12. Updating booking...');
+    // For scheduled bookings, keep status as SCHEDULED until closer to time
+    // Or change to DRIVER_ASSIGNED immediately? Let's keep as DRIVER_ASSIGNED
     booking.riderId = riderId;
     booking.cabId = cab._id;
-    booking.bookingStatus = 'DRIVER_ASSIGNED';
+    booking.bookingStatus = 'DRIVER_ASSIGNED'; // Change to assigned
     booking.acceptedAt = new Date();
     booking.isBroadcastActive = false;
     await booking.save({ session });
-    console.log('13. Booking updated successfully');
+    console.log('5. Booking updated successfully');
 
     // 8. Update the booking request status
-    console.log('14. Updating booking request...');
     bookingRequest.status = 'ACCEPTED';
     bookingRequest.responseTime = new Date();
     await bookingRequest.save({ session });
-    console.log('15. Booking request updated successfully');
+    console.log('6. Booking request updated successfully');
 
     // 9. Reject all other pending requests for this booking
-    console.log('16. Rejecting other pending requests...');
     const rejectResult = await BookingRequest.updateMany(
       {
         bookingId,
@@ -667,48 +622,54 @@ export const acceptBookingRequest = async (req, res) => {
       { session }
     );
 
-    console.log(`17. Rejected ${rejectResult.modifiedCount} other pending requests`);
+    console.log(`7. Rejected ${rejectResult.modifiedCount} other pending requests`);
 
     // 10. Update rider status
-    console.log('18. Updating rider status...');
     await Rider.findByIdAndUpdate(
       riderId,
       {
         availabilityStatus: 'ON_TRIP',
         currentBooking: booking._id,
         isLocked: true,
-        lockedUntil: new Date(Date.now() + 4 * 60 * 60 * 1000) // 4 hours lock
+        lockedUntil: new Date(Date.now() + 4 * 60 * 60 * 1000)
       },
       { session }
     );
-    console.log('19. Rider status updated');
+    console.log('8. Rider status updated');
 
     // 11. Update cab availability
-    console.log('20. Updating cab availability...');
     cab.isAvailable = false;
     await cab.save({ session });
-    console.log('21. Cab availability updated');
+    console.log('9. Cab availability updated');
 
     // 12. Get user details for notification
-    console.log('22. Getting user details...');
     const User = mongoose.model('User');
     const user = await User.findById(booking.userId).select('name');
-    console.log('23. User found:', user?._id);
-
+    
     // 13. Create notification for the user
-    console.log('24. Creating user notification...');
     const Notification = mongoose.model('Notification');
+    
+    // Customize message based on booking type
+    let notificationMessage = '';
+    if (booking.bookingType === 'SCHEDULED') {
+      notificationMessage = `Driver ${req.user.name} has accepted your scheduled ride for ${new Date(booking.scheduledAt).toLocaleString()}.`;
+    } else {
+      notificationMessage = `Driver ${req.user.name} has accepted your booking. They are on the way!`;
+    }
+    
     const userNotification = new Notification({
       userId: booking.userId,
       bookingId: booking._id,
       type: 'DRIVER_ASSIGNED',
-      title: 'Driver Assigned! 🚗',
-      message: `Driver ${req.user.name} has accepted your booking. They are on the way!`,
+      title: booking.bookingType === 'SCHEDULED' ? 'Driver Assigned for Scheduled Ride! 📅' : 'Driver Assigned! 🚗',
+      message: notificationMessage,
       data: {
         bookingId: booking._id,
         riderId,
         riderName: req.user.name,
         riderPhone: req.user.phone,
+        bookingType: booking.bookingType,
+        scheduledAt: booking.scheduledAt,
         cabDetails: {
           cabNumber: cab.cabNumber,
           cabModel: cab.cabModel,
@@ -717,13 +678,11 @@ export const acceptBookingRequest = async (req, res) => {
       }
     });
     await userNotification.save({ session });
-    console.log('25. User notification created');
 
     await session.commitTransaction();
-    console.log('26. Transaction committed successfully');
+    console.log('10. Transaction committed successfully');
 
-    // 14. Emit socket events for real-time updates
-    console.log('27. Emitting socket events...');
+    // 14. Emit socket events
     const io = req.app.get('io');
     if (io) {
       // Notify the user
@@ -732,14 +691,17 @@ export const acceptBookingRequest = async (req, res) => {
         riderId,
         riderName: req.user.name,
         riderPhone: req.user.phone,
+        bookingType: booking.bookingType,
+        scheduledAt: booking.scheduledAt,
         cabDetails: {
           cabNumber: cab.cabNumber,
           cabModel: cab.cabModel,
           cabType: cab.cabType
         },
-        estimatedArrival: '5-10 minutes'
+        message: booking.bookingType === 'SCHEDULED' 
+          ? 'Driver assigned for your scheduled ride'
+          : 'Driver assigned! They are on the way!'
       });
-      console.log('   - User notified');
 
       // Notify other riders that booking is taken
       if (booking.broadcastedTo && booking.broadcastedTo.length > 0) {
@@ -750,27 +712,28 @@ export const acceptBookingRequest = async (req, res) => {
             });
           }
         });
-        console.log(`   - Notified ${booking.broadcastedTo.length - 1} other riders`);
       }
     }
 
-    // 15. Return success response with the updated booking
-    console.log('28. Fetching populated booking...');
+    // 15. Return success response
     const populatedBooking = await Booking.findById(booking._id)
       .populate('userId', 'name phone')
       .populate('riderId', 'name phone')
       .populate('cabId');
 
-    console.log('29. Booking accepted successfully!');
-    console.log('========== END ACCEPT BOOKING REQUEST ==========');
+    console.log('11. Booking accepted successfully!');
 
     res.json({
       success: true,
-      message: 'Booking accepted successfully',
+      message: booking.bookingType === 'SCHEDULED' 
+        ? 'Scheduled booking accepted successfully' 
+        : 'Booking accepted successfully',
       data: {
         booking: populatedBooking,
         cab,
-        message: 'Please proceed to pickup location'
+        message: booking.bookingType === 'SCHEDULED'
+          ? `Please be at the pickup location on ${new Date(booking.scheduledAt).toLocaleString()}`
+          : 'Please proceed to pickup location'
       }
     });
 
@@ -781,28 +744,6 @@ export const acceptBookingRequest = async (req, res) => {
     console.error('Error message:', error.message);
     console.error('Error stack:', error.stack);
     
-    // Check for specific error types
-    if (error.name === 'ValidationError') {
-      console.error('Validation Error:', error.errors);
-      return res.status(400).json({
-        success: false,
-        message: 'Validation error',
-        errors: error.errors
-      });
-    }
-    
-    if (error.name === 'CastError') {
-      console.error('Cast Error:', {
-        path: error.path,
-        value: error.value,
-        kind: error.kind
-      });
-      return res.status(400).json({
-        success: false,
-        message: `Invalid ${error.path}: ${error.value}`
-      });
-    }
-
     res.status(500).json({
       success: false,
       message: 'Error accepting booking',
