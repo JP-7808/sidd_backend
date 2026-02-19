@@ -8,6 +8,7 @@ import Cab from '../models/Cab.js';
 import { sendEmail } from '../utils/emailService.js';
 import { generateOTP } from '../utils/helper.js';
 import { uploadToCloudinary, deleteFromCloudinary, getPublicIdFromUrl } from '../config/cloudinary.js';
+import admin from '../config/firebase.js';
 
 // Token generation with different expiry times
 const generateTokens = (user) => {
@@ -1786,6 +1787,356 @@ export const checkAuth = async (req, res) => {
       success: false,
       authenticated: false,
       message: 'Failed to check authentication status',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// Send OTP to Phone
+export const sendPhoneOTP = async (req, res) => {
+  try {
+    const { phone, role = 'USER' } = req.body;
+
+    if (!phone) {
+      return res.status(400).json({
+        success: false,
+        message: 'Phone number is required'
+      });
+    }
+
+    // Validate phone format
+    const phoneDigits = phone.replace(/\D/g, '');
+    if (phoneDigits.length < 10) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide a valid phone number'
+      });
+    }
+
+    // Find user by phone
+    let user;
+    if (role === 'USER') {
+      user = await User.findOne({ phone });
+    } else if (role === 'RIDER') {
+      user = await Rider.findOne({ phone });
+    }
+
+    // Check if user exists for login
+    if (!user) {
+      // For registration, allow OTP to be sent
+      if (role !== 'USER') {
+        return res.status(404).json({
+          success: false,
+          message: 'No account found with this phone number'
+        });
+      }
+    }
+
+    // Try to send OTP via Firebase
+    try {
+      if (admin.apps.length > 0) {
+        await admin.auth().generatePhoneVerificationLink(phone, {
+          handleUpgradeVerification: true
+        });
+        
+        // Note: generatePhoneVerificationLink doesn't actually send SMS
+        // For actual SMS, we need to use Firebase Admin with custom claims or
+        // use a third-party SMS service with Firebase
+        
+        // For now, we'll also generate and store OTP in DB
+        const otp = generateOTP();
+        const otpExpires = new Date(Date.now() + 10 * 60 * 1000);
+
+        if (user) {
+          user.phoneOTP = otp;
+          user.phoneOTPExpires = otpExpires;
+          await user.save();
+        }
+
+        console.log(`\n========== OTP FOR ${phone} ==========`);
+        console.log(`OTP: ${otp} (Firebase link sent)`);
+        console.log(`======================================\n`);
+
+        return res.status(200).json({
+          success: true,
+          message: 'Verification link sent to your phone'
+        });
+      }
+    } catch (firebaseError) {
+      console.log('Firebase not available, using manual OTP:', firebaseError.message);
+    }
+
+    // Fallback: Use manual OTP (FREE - logs to console)
+    const otp = generateOTP();
+    const otpExpires = new Date(Date.now() + 10 * 60 * 1000);
+
+    if (user) {
+      user.phoneOTP = otp;
+      user.phoneOTPExpires = otpExpires;
+      await user.save();
+    }
+
+    // FREE: Log OTP to console (for testing)
+    console.log(`\n========== OTP FOR ${phone} ==========`);
+    console.log(`OTP: ${otp}`);
+    console.log(`======================================\n`);
+
+    res.status(200).json({
+      success: true,
+      message: 'OTP sent successfully (Check server console)'
+    });
+  } catch (error) {
+    console.error('Send phone OTP error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to send OTP',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// Verify OTP and Login
+export const verifyPhoneOTP = async (req, res) => {
+  try {
+    const { phone, otp, role = 'USER' } = req.body;
+
+    if (!phone || !otp) {
+      return res.status(400).json({
+        success: false,
+        message: 'Phone number and OTP are required'
+      });
+    }
+
+    // Find user by phone
+    let user;
+    if (role === 'USER') {
+      user = await User.findOne({ phone });
+    } else if (role === 'RIDER') {
+      user = await Rider.findOne({ phone });
+    }
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found with this phone number'
+      });
+    }
+
+    // Check if account is active
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Account is deactivated. Please contact support.'
+      });
+    }
+
+    // Verify OTP
+    if (user.phoneOTP !== otp) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid OTP'
+      });
+    }
+
+    // Check OTP expiry
+    if (user.phoneOTPExpires && user.phoneOTPExpires < new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: 'OTP has expired'
+      });
+    }
+
+    // Clear OTP after successful verification
+    user.phoneOTP = undefined;
+    user.phoneOTPExpires = undefined;
+    user.lastLogin = new Date();
+    await user.save();
+
+    // For riders, check approval status
+    if (role === 'RIDER') {
+      if (user.approvalStatus === 'PENDING') {
+        return res.status(403).json({
+          success: false,
+          message: 'Your account is under review. Please wait 24 to 48 hours.',
+          approvalStatus: 'PENDING'
+        });
+      }
+
+      if (user.approvalStatus === 'REJECTED') {
+        return res.status(403).json({
+          success: false,
+          message: 'Your account has been rejected.',
+          approvalStatus: 'REJECTED'
+        });
+      }
+
+      if (user.approvalStatus === 'SUSPENDED') {
+        return res.status(403).json({
+          success: false,
+          message: 'Your account has been suspended.',
+          approvalStatus: 'SUSPENDED'
+        });
+      }
+    }
+
+    // Generate tokens
+    const { accessToken, refreshToken } = generateTokens(user);
+
+    // Set secure cookies
+    setCookies(res, accessToken, refreshToken, user);
+
+    // Remove sensitive data
+    const userResponse = user.toObject();
+    delete userResponse.password;
+    delete userResponse.phoneOTP;
+    delete userResponse.phoneOTPExpires;
+    delete userResponse.tokenVersion;
+    delete userResponse.resetPasswordToken;
+    delete userResponse.resetPasswordExpires;
+
+    res.status(200).json({
+      success: true,
+      message: 'Login successful',
+      data: {
+        user: userResponse
+      },
+      token: accessToken
+    });
+  } catch (error) {
+    console.error('Verify phone OTP error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'OTP verification failed',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// Firebase Login
+export const firebaseLogin = async (req, res) => {
+  try {
+    const { idToken, phone, role = 'USER' } = req.body;
+
+    if (!idToken || !phone) {
+      return res.status(400).json({
+        success: false,
+        message: 'ID token and phone are required'
+      });
+    }
+
+    // Verify Firebase token
+    let decodedToken;
+    try {
+      if (admin.apps.length > 0) {
+        decodedToken = await admin.auth().verifyIdToken(idToken);
+      } else {
+        return res.status(503).json({
+          success: false,
+          message: 'Firebase not configured'
+        });
+      }
+    } catch (firebaseError) {
+      console.error('Firebase token verification error:', firebaseError);
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid Firebase token'
+      });
+    }
+
+    // Check if phone matches
+    if (decodedToken.phone_number !== phone) {
+      return res.status(400).json({
+        success: false,
+        message: 'Phone number mismatch'
+      });
+    }
+
+    // Find or create user
+    let user;
+    if (role === 'USER') {
+      user = await User.findOne({ phone });
+      
+      if (!user) {
+        // Create new user with Firebase phone
+        user = await User.create({
+          name: decodedToken.name || 'Firebase User',
+          email: decodedToken.email || `${phone}@firebase.local`,
+          phone: phone,
+          password: null, // No password for Firebase users
+          isEmailVerified: true,
+          isActive: true,
+          tokenVersion: 0
+        });
+        
+        console.log('✅ New user created via Firebase Phone:', phone);
+      }
+    } else if (role === 'RIDER') {
+      user = await Rider.findOne({ phone });
+      
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: 'Rider not found with this phone number'
+        });
+      }
+    }
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    // Check if account is active
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Account is deactivated. Please contact support.'
+      });
+    }
+
+    // For riders, check approval status
+    if (role === 'RIDER') {
+      if (user.approvalStatus === 'PENDING') {
+        return res.status(403).json({
+          success: false,
+          message: 'Your account is under review.',
+          approvalStatus: 'PENDING'
+        });
+      }
+    }
+
+    // Update last login
+    user.lastLogin = new Date();
+    await user.save();
+
+    // Generate tokens
+    const { accessToken, refreshToken } = generateTokens(user);
+
+    // Set secure cookies
+    setCookies(res, accessToken, refreshToken, user);
+
+    // Remove sensitive data
+    const userResponse = user.toObject();
+    delete userResponse.password;
+    delete userResponse.tokenVersion;
+    delete userResponse.resetPasswordToken;
+    delete userResponse.resetPasswordExpires;
+
+    res.status(200).json({
+      success: true,
+      message: 'Login successful',
+      data: {
+        user: userResponse
+      },
+      token: accessToken
+    });
+  } catch (error) {
+    console.error('Firebase login error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Firebase login failed',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }

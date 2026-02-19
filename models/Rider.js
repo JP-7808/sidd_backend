@@ -27,6 +27,13 @@ const riderSchema = new mongoose.Schema({
     required: true
   },
 
+  phoneOTP: {
+    type: String
+  },
+  phoneOTPExpires: {
+    type: Date
+  },
+
   photo: {
     type: String,
     required: true

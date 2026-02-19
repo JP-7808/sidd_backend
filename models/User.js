@@ -48,7 +48,14 @@ const userSchema = new mongoose.Schema({
     type: Date
   },
 
-  role: { 
+  phoneOTP: {
+    type: String
+  },
+  phoneOTPExpires: {
+    type: Date
+  },
+
+  role: {
     type: String, 
     enum: ["USER", "ADMIN"],
     default: "USER" 

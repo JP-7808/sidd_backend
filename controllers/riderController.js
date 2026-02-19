@@ -94,6 +94,99 @@ export const updateRiderProfile = async (req, res) => {
   }
 };
 
+// Update rider documents (Aadhaar, Driving License, Police Verification)
+export const updateRiderDocuments = async (req, res) => {
+  try {
+    const riderId = req.user._id;
+    const { 
+      aadhaarNumber, 
+      drivingLicenseNumber,
+      homeAddress
+    } = req.body;
+    
+    const files = req.files || {};
+    
+    const rider = await Rider.findById(riderId);
+    
+    if (!rider) {
+      return res.status(404).json({
+        success: false,
+        message: "Rider not found",
+      });
+    }
+
+    // Update text fields
+    if (aadhaarNumber) rider.aadhaarNumber = aadhaarNumber;
+    if (drivingLicenseNumber) rider.drivingLicenseNumber = drivingLicenseNumber;
+    if (homeAddress) rider.homeAddress = homeAddress;
+
+    // Upload Aadhaar images
+    if (files.aadhaarFront && files.aadhaarFront[0]) {
+      const result = await uploadToCloudinary(files.aadhaarFront[0].buffer, {
+        folder: `riders/${riderId}/documents`,
+      });
+      rider.aadhaarImage.front = result.secure_url;
+    }
+    
+    if (files.aadhaarBack && files.aadhaarBack[0]) {
+      const result = await uploadToCloudinary(files.aadhaarBack[0].buffer, {
+        folder: `riders/${riderId}/documents`,
+      });
+      rider.aadhaarImage.back = result.secure_url;
+    }
+
+    // Upload Driving License images
+    if (files.drivingLicenseFront && files.drivingLicenseFront[0]) {
+      const result = await uploadToCloudinary(files.drivingLicenseFront[0].buffer, {
+        folder: `riders/${riderId}/documents`,
+      });
+      rider.drivingLicenseImage.front = result.secure_url;
+    }
+    
+    if (files.drivingLicenseBack && files.drivingLicenseBack[0]) {
+      const result = await uploadToCloudinary(files.drivingLicenseBack[0].buffer, {
+        folder: `riders/${riderId}/documents`,
+      });
+      rider.drivingLicenseImage.back = result.secure_url;
+    }
+
+    // Upload Police Verification
+    if (files.policeVerification && files.policeVerification[0]) {
+      const result = await uploadToCloudinary(files.policeVerification[0].buffer, {
+        folder: `riders/${riderId}/documents`,
+      });
+      rider.policeVerificationImage = result.secure_url;
+    }
+
+    // Reset approval status to PENDING if documents updated
+    if (files.aadhaarFront || files.aadhaarBack || files.drivingLicenseFront || 
+        files.drivingLicenseBack || files.policeVerification || aadhaarNumber || drivingLicenseNumber) {
+      rider.approvalStatus = "PENDING";
+    }
+
+    await rider.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Documents updated successfully",
+      data: {
+        aadhaarNumber: rider.aadhaarNumber,
+        aadhaarImage: rider.aadhaarImage,
+        drivingLicenseNumber: rider.drivingLicenseNumber,
+        drivingLicenseImage: rider.drivingLicenseImage,
+        policeVerificationImage: rider.policeVerificationImage,
+        approvalStatus: rider.approvalStatus,
+      },
+    });
+  } catch (error) {
+    console.error("Update rider documents error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update documents",
+    });
+  }
+};
+
 // Update rider location
 export const updateRiderLocation = async (req, res) => {
   try {
