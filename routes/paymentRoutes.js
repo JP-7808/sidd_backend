@@ -1,33 +1,37 @@
+// routes/paymentRoutes.js
 import express from 'express';
 import {
-  createPaymentOrder,
+  authenticate,
+  authorize,
+  isUser,
+  isAdmin
+} from '../middleware/authMiddleware.js';
+import {
+  createOrder,
   verifyPayment,
-  getPaymentDetails,
   processCashPayment,
   processWalletPayment,
-  initiateRefund,
-  getPaymentHistory,
-  razorpayWebhook,
-  completeCashPayment
+  getPaymentDetails,
+  getUserPayments,
+  processRefund,
+  getPaymentStats
 } from '../controllers/paymentController.js';
-import { authenticate, authorize } from '../middleware/authMiddleware.js';
 
 const router = express.Router();
-
-// Webhook route (no authentication needed)
-router.post('/webhook/razorpay', razorpayWebhook);
 
 // Protected routes
 router.use(authenticate);
 
-// Payment routes
-router.post('/create-order', authorize('USER'), createPaymentOrder);
-router.post('/verify', authorize('USER'), verifyPayment);
-router.post('/complete-cash', authorize('USER'), completeCashPayment);
-router.get('/booking/:bookingId', getPaymentDetails);
-router.post('/cash', authorize('RIDER'), processCashPayment);
-router.post('/wallet', authorize('USER'), processWalletPayment);
-router.post('/refund', authorize('ADMIN'), initiateRefund);
-router.get('/history', getPaymentHistory);
+// User routes
+router.post('/create-order', isUser, createOrder);
+router.post('/verify', isUser, verifyPayment);
+router.post('/cash', isUser, processCashPayment);
+router.post('/wallet', isUser, processWalletPayment);
+router.get('/user/my-payments', isUser, getUserPayments);
+router.get('/:id', getPaymentDetails);
+
+// Admin routes
+router.post('/:id/refund', isAdmin, processRefund);
+router.get('/admin/stats', isAdmin, getPaymentStats);
 
 export default router;

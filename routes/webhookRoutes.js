@@ -4,7 +4,7 @@ import { razorpayWebhook } from '../controllers/paymentController.js';
 
 const router = express.Router();
 
-// IMPORTANT: Disable body parser for webhooks to get raw body
+// Raw body needed for webhook signature verification
 router.post('/razorpay', express.raw({ type: 'application/json' }), razorpayWebhook);
 
 export default router;
