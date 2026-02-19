@@ -502,7 +502,7 @@ export const broadcastToNearbyRiders = async (bookingId, io, bookingType = 'IMME
     // Set different expiry times based on booking type
     // Scheduled bookings: 30 minutes to respond
     // Immediate bookings: 90 seconds to respond
-    const expiresAt = new Date(Date.now() + (booking.bookingType === 'SCHEDULED' ? 30 * 60 * 1000 : 90 * 1000));
+    const expiresAt = new Date(Date.now() + (booking.bookingType === 'SCHEDULED' ? 30 * 60 * 1000 : 60 * 15 * 1000));
 
     // Create booking requests for each rider
     const bookingRequests = [];
@@ -527,7 +527,7 @@ export const broadcastToNearbyRiders = async (bookingId, io, bookingType = 'IMME
 
     if (bookingRequests.length > 0) {
       await BookingRequest.insertMany(bookingRequests, { session });
-      console.log(`✅ Created ${bookingRequests.length} booking requests (expires in ${booking.bookingType === 'SCHEDULED' ? '30 minutes' : '90 seconds'})`);
+      console.log(`✅ Created ${bookingRequests.length} booking requests (expires in ${booking.bookingType === 'SCHEDULED' ? '30 minutes' : '15 seconds'})`);
     }
 
     // Update booking

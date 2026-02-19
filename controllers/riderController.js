@@ -430,73 +430,108 @@ export const toggleOnlineStatus = async (req, res) => {
 // Get available bookings - Simplified and error-free
 // controllers/riderController.js - Updated getAvailableBookings
 
+// controllers/riderController.js - Fixed getAvailableBookings
+
 export const getAvailableBookings = async (req, res) => {
   try {
     const riderId = req.user._id;
-    const { lat, lng, radius = 10 } = req.query;
+    const { lat, lng, radius = 30 } = req.query;
 
     console.log('========== GET AVAILABLE BOOKINGS ==========');
     console.log(`Rider ID: ${riderId}`);
     console.log(`Location: lat=${lat}, lng=${lng}, radius=${radius}`);
+    console.log(`Current server time: ${new Date().toISOString()}`);
 
-    // 1. Find all pending requests for this rider that haven't expired
+    // 1. First, let's check ALL booking requests for this rider (for debugging)
+    const allRiderRequests = await BookingRequest.find({ riderId })
+      .sort({ createdAt: -1 })
+      .limit(10);
+    
+    console.log(`📊 Total requests in DB for this rider: ${allRiderRequests.length}`);
+    console.log('Recent requests:', allRiderRequests.map(r => ({
+      bookingId: r.bookingId,
+      status: r.status,
+      expiresAt: r.expiresAt,
+      createdAt: r.createdAt
+    })));
+
+    // 2. Find all pending requests that haven't expired
     const pendingRequests = await BookingRequest.find({
       riderId,
       status: 'PENDING',
       expiresAt: { $gt: new Date() }
     });
 
-    console.log(`Found ${pendingRequests.length} pending requests:`, 
+    console.log(`✅ Found ${pendingRequests.length} valid pending requests:`, 
       pendingRequests.map(r => ({ 
         bookingId: r.bookingId, 
         expiresAt: r.expiresAt,
-        bookingType: r.bookingType
+        timeLeft: Math.round((r.expiresAt - new Date()) / 1000) + 's'
       }))
     );
 
     const bookingIds = pendingRequests.map(req => req.bookingId);
 
     if (bookingIds.length === 0) {
-      console.log('No pending requests found');
+      console.log('❌ No valid pending requests found');
+      
+      // Check if there are expired requests
+      const expiredRequests = await BookingRequest.find({
+        riderId,
+        status: 'PENDING',
+        expiresAt: { $lte: new Date() }
+      });
+      
+      if (expiredRequests.length > 0) {
+        console.log(`⚠️ Found ${expiredRequests.length} expired requests:`, 
+          expiredRequests.map(r => ({
+            bookingId: r.bookingId,
+            expiredAgo: Math.round((new Date() - r.expiresAt) / 1000) + 's ago'
+          }))
+        );
+      }
+      
       return res.json({
         success: true,
         data: []
       });
     }
 
-    // 2. Get the actual bookings - INCLUDE SCHEDULED status!
-    // For scheduled bookings, we want to show them even though they're not SEARCHING_DRIVER yet
-    console.log('Looking for bookings with IDs:', bookingIds);
-    console.log('Booking status filter:', ['INITIATED', 'SEARCHING_DRIVER', 'SCHEDULED']);
-
-    const bookings = await Booking.find({
-      _id: { $in: bookingIds },
-      bookingStatus: { $in: ['INITIATED', 'SEARCHING_DRIVER', 'SCHEDULED'] }
-    })
-    .populate('userId', 'name phone rating')
-    .select('pickup drop vehicleType distanceKm estimatedFare bookingStatus createdAt userId bookingType scheduledAt');
-
-    console.log(`Found ${bookings.length} matching bookings:`, 
-      bookings.map(b => ({ 
-        id: b._id, 
-        status: b.bookingStatus,
-        vehicleType: b.vehicleType,
-        bookingType: b.bookingType
-      }))
+    // 3. Get the actual bookings - ALLOW ALL ACCEPTABLE STATUSES
+    console.log('🔍 Looking for bookings with IDs:', bookingIds);
+    
+    // First, check if these bookings exist at all
+    const anyBookings = await Booking.find({
+      _id: { $in: bookingIds }
+    }).select('_id bookingStatus');
+    
+    console.log('📚 All found bookings (any status):', 
+      anyBookings.map(b => ({ id: b._id, status: b.bookingStatus }))
     );
 
-    // If no bookings found, check if bookings exist but with different status
-    if (bookings.length === 0) {
-      const allBookings = await Booking.find({
-        _id: { $in: bookingIds }
-      }).select('_id bookingStatus bookingType');
-      
-      console.log('All bookings (regardless of status):', 
-        allBookings.map(b => ({ id: b._id, status: b.bookingStatus, type: b.bookingType }))
-      );
-    }
+    // Now get the ones with acceptable statuses
+    const bookings = await Booking.find({
+      _id: { $in: bookingIds },
+      bookingStatus: { 
+        $in: [
+          'INITIATED', 
+          'SEARCHING_DRIVER', 
+          'SCHEDULED',
+          'PENDING',
+          'DRIVER_ASSIGNED'
+        ] 
+      },
+      $or: [
+        { riderId: null },
+        { riderId: { $exists: false } }
+      ]
+    })
+    .populate('userId', 'name phone rating')
+    .select('pickup drop vehicleType distanceKm estimatedFare bookingStatus createdAt userId bookingType scheduledAt tripType');
 
-    // 3. Format the response data
+    console.log(`✅ Found ${bookings.length} matching bookings with acceptable status`);
+
+    // 4. Format the response data
     const formattedBookings = bookings.map(booking => {
       const pendingRequest = pendingRequests.find(r => 
         r.bookingId.toString() === booking._id.toString()
@@ -504,8 +539,16 @@ export const getAvailableBookings = async (req, res) => {
 
       return {
         _id: booking._id,
-        pickup: booking.pickup || {},
-        drop: booking.drop || {},
+        pickup: {
+          addressText: booking.pickup?.addressText || 'Pickup location',
+          lat: booking.pickup?.lat || 0,
+          lng: booking.pickup?.lng || 0
+        },
+        drop: {
+          addressText: booking.drop?.addressText || 'Drop location',
+          lat: booking.drop?.lat || 0,
+          lng: booking.drop?.lng || 0
+        },
         vehicleType: booking.vehicleType,
         distanceKm: booking.distanceKm || 0,
         estimatedFare: booking.estimatedFare || 0,
@@ -526,7 +569,7 @@ export const getAvailableBookings = async (req, res) => {
       };
     });
 
-    console.log(`Returning ${formattedBookings.length} formatted bookings`);
+    console.log(`✅ Returning ${formattedBookings.length} formatted bookings`);
     console.log('========== END GET AVAILABLE BOOKINGS ==========');
 
     res.json({
