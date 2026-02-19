@@ -9,7 +9,6 @@ import cookieParser from 'cookie-parser';
 import { Server } from 'socket.io';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import scheduler from './schedule.js';
 
 // Load environment variables
 dotenv.config();
@@ -27,6 +26,7 @@ import bookingRoutes from './routes/bookingRoutes.js';
 import paymentRoutes from './routes/paymentRoutes.js';
 import searchRoutes from './routes/searchRoutes.js';
 import webhookRoutes from './routes/webhookRoutes.js';
+import pricingRoutes from './routes/pricingRoutes.js';
 
 // Import middleware
 import errorHandler from './middleware/errorHandler.js';
@@ -273,6 +273,7 @@ app.use('/api/bookings', bookingRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/search', searchRoutes);
 app.use('/webhook', webhookRoutes);
+app.use('/api/pricing', pricingRoutes );
 
 // Health check
 app.get('/health', (req, res) => {
@@ -309,18 +310,12 @@ const connectDB = async () => {
   }
 };
 
-console.log('✅ Scheduler started for scheduled bookings');
 
 // Start server
 const PORT = process.env.PORT || 5001;
 const startServer = async () => {
   try {
     await connectDB();
-
-    // Start scheduler
-import('./schedule.js').then(() => {
-  console.log('✅ Booking scheduler started');
-});
     
     // Create default admin if not exists
     await createDefaultAdmin();

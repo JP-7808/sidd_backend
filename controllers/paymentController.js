@@ -1,22 +1,23 @@
-import mongoose from 'mongoose';
+// controllers/paymentController.js
 import Payment from '../models/Payment.js';
 import Booking from '../models/Booking.js';
 import User from '../models/User.js';
-import RiderWallet from '../models/RiderWallet.js';
-import Razorpay from 'razorpay';
-import crypto from 'crypto';
+import UserWallet from '../models/UserWallet.js';
 import Notification from '../models/Notification.js';
+import {
+  createRazorpayOrder,
+  verifyPaymentSignature,
+  fetchPaymentDetails,
+  refundPayment
+} from '../config/razorpay.js';
+import mongoose from 'mongoose';
 
-// Initialize Razorpay
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET
-});
-
-// Create payment order
-export const createPaymentOrder = async (req, res) => {
+// @desc    Create Razorpay order
+// @route   POST /api/payments/create-order
+// @access  Private
+export const createOrder = async (req, res) => {
   try {
-    const { bookingId, amount, paymentType = 'FULL' } = req.body;
+    const { bookingId, amount } = req.body;
     const userId = req.user._id;
 
     // Validate booking
@@ -32,84 +33,89 @@ export const createPaymentOrder = async (req, res) => {
       });
     }
 
-    // Validate amount
-    if (paymentType === 'FULL' && amount < booking.estimatedFare) {
+    // Check if payment already exists
+    const existingPayment = await Payment.findOne({
+      bookingId,
+      paymentStatus: { $in: ['SUCCESS', 'PENDING'] }
+    });
+
+    if (existingPayment && existingPayment.paymentStatus === 'SUCCESS') {
       return res.status(400).json({
         success: false,
-        message: `Minimum payment amount is ₹${booking.estimatedFare}`
+        message: 'Payment already completed for this booking'
       });
     }
 
     // Create Razorpay order
-    const razorpayOrder = await razorpay.orders.create({
-      amount: Math.round(amount * 100), // Convert to paise
-      currency: 'INR',
-      receipt: `booking_${bookingId}`,
-      notes: {
-        bookingId: bookingId.toString(),
-        userId: userId.toString(),
-        paymentType
-      }
-    });
+    const receipt = `receipt_${bookingId.toString().slice(-8)}`;
+    const order = await createRazorpayOrder(
+      amount || booking.estimatedFare,
+      'INR',
+      receipt,
+      { bookingId: bookingId.toString(), userId: userId.toString() }
+    );
 
-    // Create payment record
-    const payment = await Payment.create({
-      bookingId,
-      userId,
-      razorpayOrderId: razorpayOrder.id,
-      amount,
-      paymentMethod: 'RAZORPAY',
-      paymentType,
-      paymentStatus: 'PENDING',
-      currency: 'INR',
-      description: `Payment for booking #${bookingId}`,
-      metadata: {
-        razorpayOrder: razorpayOrder
-      }
-    });
+    // Update or create payment record
+    let payment = existingPayment;
+    if (!payment) {
+      payment = new Payment({
+        bookingId,
+        userId,
+        amount: amount || booking.estimatedFare,
+        paymentMethod: 'RAZORPAY',
+        paymentType: 'FULL',
+        paymentStatus: 'PENDING',
+        razorpayOrderId: order.id,
+        description: `Payment for booking ${bookingId}`
+      });
+    } else {
+      payment.razorpayOrderId = order.id;
+      payment.amount = amount || booking.estimatedFare;
+    }
 
-    res.status(200).json({
+    await payment.save();
+
+    res.json({
       success: true,
       data: {
-        orderId: razorpayOrder.id,
-        amount: razorpayOrder.amount / 100,
-        currency: razorpayOrder.currency,
+        orderId: order.id,
+        amount: order.amount,
+        currency: order.currency,
+        key: process.env.RAZORPAY_KEY_ID,
         paymentId: payment._id
       }
     });
   } catch (error) {
-    console.error('Create payment order error:', error);
+    console.error('Create order error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to create payment order'
+      message: 'Error creating payment order'
     });
   }
 };
 
-// Verify payment and complete booking
+// @desc    Verify Razorpay payment
+// @route   POST /api/payments/verify
+// @access  Private
 export const verifyPayment = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
-  
+
   try {
     const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      paymentId
+      razorpayOrderId,
+      razorpayPaymentId,
+      razorpaySignature,
+      bookingId
     } = req.body;
 
-    const userId = req.user._id;
-
-    // Get payment record
+    // Find payment
     const payment = await Payment.findOne({
-      _id: paymentId,
-      userId,
-      razorpayOrderId: razorpay_order_id
+      bookingId,
+      razorpayOrderId
     }).session(session);
 
     if (!payment) {
-      await session.abortTransaction();
       return res.status(404).json({
         success: false,
         message: 'Payment not found'
@@ -117,77 +123,88 @@ export const verifyPayment = async (req, res) => {
     }
 
     // Verify signature
-    const body = razorpay_order_id + "|" + razorpay_payment_id;
-    const expectedSignature = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-      .update(body.toString())
-      .digest('hex');
+    const isValid = verifyPaymentSignature(
+      razorpayOrderId,
+      razorpayPaymentId,
+      razorpaySignature
+    );
 
-    if (expectedSignature !== razorpay_signature) {
+    if (!isValid) {
       payment.paymentStatus = 'FAILED';
       await payment.save({ session });
-      await session.abortTransaction();
-
+      
+      await session.commitTransaction();
+      
       return res.status(400).json({
         success: false,
-        message: 'Payment verification failed'
+        message: 'Invalid payment signature'
       });
     }
 
-    // Update payment record
-    payment.razorpayPaymentId = razorpay_payment_id;
-    payment.razorpaySignature = razorpay_signature;
+    // Fetch payment details from Razorpay
+    const paymentDetails = await fetchPaymentDetails(razorpayPaymentId);
+
+    // Update payment
+    payment.razorpayPaymentId = razorpayPaymentId;
+    payment.razorpaySignature = razorpaySignature;
     payment.paymentStatus = 'SUCCESS';
-    payment.updatedAt = new Date();
+    payment.metadata = {
+      ...payment.metadata,
+      razorpayResponse: paymentDetails
+    };
     await payment.save({ session });
 
-    // Update booking - mark as payment done
-    const booking = await Booking.findById(payment.bookingId).session(session);
-    if (booking) {
-      if (!['TRIP_COMPLETED', 'CANCELLED'].includes(booking.bookingStatus)) {
-    booking.bookingStatus = 'PAYMENT_DONE';
-  }
-      booking.paymentStatus = 'PAID';
-      await booking.save({ session });
+    // Update booking payment status
+    const booking = await Booking.findByIdAndUpdate(
+      bookingId,
+      {
+        paymentStatus: 'PAID',
+        bookingStatus: payment.amount === booking.estimatedFare 
+          ? 'SEARCHING_DRIVER' 
+          : booking.bookingStatus
+      },
+      { session, new: true }
+    );
+
+    // If payment is via wallet, update wallet balance
+    if (payment.paymentMethod === 'WALLET') {
+      const wallet = await UserWallet.findOne({ userId: payment.userId }).session(session);
+      if (wallet) {
+        wallet.balance -= payment.amount;
+        wallet.transactions.push({
+          type: 'DEBIT',
+          amount: payment.amount,
+          description: `Payment for booking ${bookingId}`,
+          referenceId: bookingId,
+          referenceModel: 'Booking'
+        });
+        await wallet.save({ session });
+      }
     }
 
     // Create notification
-    await Notification.create([{
-      userId,
-      bookingId: payment.bookingId,
+    const notification = new Notification({
+      userId: payment.userId,
+      bookingId,
       type: 'PAYMENT_SUCCESS',
       title: 'Payment Successful',
-      message: `Payment of ₹${payment.amount} completed successfully. Booking completed!`,
+      message: `Payment of ₹${payment.amount} completed successfully`,
       data: {
-        amount: payment.amount,
+        bookingId,
         paymentId: payment._id,
-        bookingId: payment.bookingId
+        amount: payment.amount
       }
-    }], { session });
+    });
+    await notification.save({ session });
 
     await session.commitTransaction();
 
-    // Notify via socket
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`user-${userId}`).emit('payment-completed', {
-        bookingId: payment.bookingId,
-        paymentId: payment._id,
-        amount: payment.amount,
-        status: 'SUCCESS'
-      });
-    }
-
-    res.status(200).json({
+    res.json({
       success: true,
-      message: 'Payment verified and booking completed successfully',
+      message: 'Payment verified successfully',
       data: {
         payment,
-        booking: {
-          id: booking._id,
-          status: booking.bookingStatus,
-          finalFare: payment.amount
-        }
+        booking
       }
     });
   } catch (error) {
@@ -195,18 +212,20 @@ export const verifyPayment = async (req, res) => {
     console.error('Verify payment error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to verify payment'
+      message: 'Error verifying payment'
     });
   } finally {
     session.endSession();
   }
 };
 
-// Complete cash payment
-export const completeCashPayment = async (req, res) => {
+// @desc    Process cash payment
+// @route   POST /api/payments/cash
+// @access  Private
+export const processCashPayment = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
-  
+
   try {
     const { bookingId } = req.body;
     const userId = req.user._id;
@@ -214,106 +233,71 @@ export const completeCashPayment = async (req, res) => {
     // Find booking
     const booking = await Booking.findOne({
       _id: bookingId,
-      userId,
-      bookingStatus: 'TRIP_COMPLETED',
-      paymentMethod: 'CASH'
+      userId
     }).session(session);
 
     if (!booking) {
-      await session.abortTransaction();
       return res.status(404).json({
         success: false,
-        message: 'Booking not found or not eligible for cash payment'
+        message: 'Booking not found'
       });
     }
 
-    // Create cash payment record
+    // Check if payment method is cash
+    if (booking.paymentMethod !== 'CASH') {
+      return res.status(400).json({
+        success: false,
+        message: 'This booking does not use cash payment'
+      });
+    }
+
+    // Create payment record
     const payment = new Payment({
       bookingId,
       userId,
-      amount: booking.finalFare || booking.estimatedFare,
+      amount: booking.estimatedFare,
       paymentMethod: 'CASH',
       paymentType: 'FULL',
-      paymentStatus: 'SUCCESS',
-      currency: 'INR',
-      description: `Cash payment for booking #${bookingId}`,
-      metadata: {
-        paidAt: new Date(),
-        confirmedByUser: true
-      }
+      paymentStatus: 'PENDING', // Will be completed after trip
+      description: `Cash payment for booking ${bookingId}`
     });
-
     await payment.save({ session });
-
-    // Update booking status
-    booking.bookingStatus = 'PAYMENT_DONE';
-    booking.paymentStatus = 'PAID';
-    await booking.save({ session });
-
-    // Create notification
-    await Notification.create([{
-      userId,
-      bookingId,
-      type: 'PAYMENT_SUCCESS',
-      title: 'Cash Payment Confirmed',
-      message: `Cash payment of ₹${payment.amount} confirmed. Booking completed!`,
-      data: {
-        amount: payment.amount,
-        paymentMethod: 'CASH',
-        bookingId
-      }
-    }], { session });
 
     await session.commitTransaction();
 
-    // Notify via socket
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`user-${userId}`).emit('payment-completed', {
-        bookingId,
-        paymentId: payment._id,
-        amount: payment.amount,
-        status: 'SUCCESS',
-        method: 'CASH'
-      });
-    }
-
-    res.status(200).json({
+    res.json({
       success: true,
-      message: 'Cash payment confirmed and booking completed',
-      data: {
-        payment,
-        booking: {
-          id: booking._id,
-          status: booking.bookingStatus,
-          finalFare: payment.amount
-        }
-      }
+      message: 'Cash payment recorded',
+      data: payment
     });
-
   } catch (error) {
     await session.abortTransaction();
-    console.error('Complete cash payment error:', error);
+    console.error('Cash payment error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to complete cash payment'
+      message: 'Error processing cash payment'
     });
   } finally {
     session.endSession();
   }
 };
 
-// Get payment details
-export const getPaymentDetails = async (req, res) => {
+// @desc    Process wallet payment
+// @route   POST /api/payments/wallet
+// @access  Private
+export const processWalletPayment = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
-    const { bookingId } = req.params;
+    const { bookingId } = req.body;
     const userId = req.user._id;
 
-    // Check booking access
+    // Find booking
     const booking = await Booking.findOne({
       _id: bookingId,
       userId
-    });
+    }).session(session);
 
     if (!booking) {
       return res.status(404).json({
@@ -322,222 +306,112 @@ export const getPaymentDetails = async (req, res) => {
       });
     }
 
-    // Get payment details
-    const payments = await Payment.find({ 
-      bookingId,
-      userId 
-    }).sort({ createdAt: -1 });
-
-    const totalPaid = payments
-      .filter(p => p.paymentStatus === 'SUCCESS')
-      .reduce((sum, p) => sum + p.amount, 0);
-
-    res.status(200).json({
-      success: true,
-      data: {
-        booking: {
-          estimatedFare: booking.estimatedFare,
-          paidAmount: booking.paidAmount,
-          pendingAmount: booking.pendingAmount,
-          finalFare: booking.finalFare,
-          paymentType: booking.paymentType
-        },
-        payments,
-        summary: {
-          totalPaid,
-          totalPending: Math.max(0, booking.estimatedFare - totalPaid),
-          totalPayments: payments.length
-        }
-      }
-    });
-  } catch (error) {
-    console.error('Get payment details error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to get payment details'
-    });
-  }
-};
-
-// Process cash payment
-export const processCashPayment = async (req, res) => {
-  try {
-    const { bookingId, amount } = req.body;
-    const userId = req.user._id;
-
-    // Check if user is rider
-    if (req.user.role !== 'RIDER') {
-      return res.status(403).json({
-        success: false,
-        message: 'Only riders can process cash payments'
-      });
-    }
-
-    const booking = await Booking.findOne({
-      _id: bookingId,
-      riderId: req.user._id,
-      bookingStatus: 'COMPLETED',
-      paymentType: 'CASH'
-    });
-
-    if (!booking) {
-      return res.status(404).json({
-        success: false,
-        message: 'Booking not found or not eligible for cash payment'
-      });
-    }
-
-    // Validate amount
-    if (amount <= 0 || amount > booking.finalFare) {
+    // Check if payment method is wallet
+    if (booking.paymentMethod !== 'WALLET') {
       return res.status(400).json({
         success: false,
-        message: `Invalid amount. Maximum allowed: ₹${booking.finalFare}`
+        message: 'This booking does not use wallet payment'
       });
     }
 
-    // Create cash payment record
-    const payment = await Payment.create({
+    // Get user wallet
+    const wallet = await UserWallet.findOne({ userId }).session(session);
+
+    if (!wallet) {
+      return res.status(404).json({
+        success: false,
+        message: 'Wallet not found'
+      });
+    }
+
+    // Check sufficient balance
+    if (wallet.balance < booking.estimatedFare) {
+      return res.status(400).json({
+        success: false,
+        message: 'Insufficient wallet balance',
+        data: {
+          required: booking.estimatedFare,
+          available: wallet.balance
+        }
+      });
+    }
+
+    // Create payment record
+    const payment = new Payment({
       bookingId,
-      userId: booking.userId,
-      amount,
-      paymentMethod: 'CASH',
+      userId,
+      amount: booking.estimatedFare,
+      paymentMethod: 'WALLET',
       paymentType: 'FULL',
       paymentStatus: 'SUCCESS',
-      currency: 'INR',
-      description: `Cash payment for booking #${bookingId}`,
-      metadata: {
-        collectedBy: req.user._id,
-        collectedAt: new Date()
-      }
+      description: `Wallet payment for booking ${bookingId}`
     });
+    await payment.save({ session });
 
-    // Update booking
-    booking.paidAmount += amount;
-    booking.pendingAmount = Math.max(0, booking.finalFare - booking.paidAmount);
-    await booking.save();
+    // Update wallet balance
+    wallet.balance -= booking.estimatedFare;
+    wallet.transactions.push({
+      type: 'DEBIT',
+      amount: booking.estimatedFare,
+      description: `Payment for booking ${bookingId}`,
+      referenceId: bookingId,
+      referenceModel: 'Booking'
+    });
+    await wallet.save({ session });
 
-    // Create notification for user
-    await Notification.create({
-      userId: booking.userId,
+    // Update booking payment status
+    booking.paymentStatus = 'PAID';
+    booking.bookingStatus = 'SEARCHING_DRIVER';
+    await booking.save({ session });
+
+    // Create notification
+    const notification = new Notification({
+      userId,
       bookingId,
       type: 'PAYMENT_SUCCESS',
-      title: 'Cash Payment Received',
-      message: `Cash payment of ₹${amount} received for your ride`,
+      title: 'Payment Successful',
+      message: `Payment of ₹${booking.estimatedFare} completed via wallet`,
       data: {
-        amount,
         bookingId,
-        riderName: req.user.name
+        amount: booking.estimatedFare
       }
     });
+    await notification.save({ session });
 
-    res.status(200).json({
-      success: true,
-      message: 'Cash payment recorded successfully',
-      data: payment
-    });
-  } catch (error) {
-    console.error('Process cash payment error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to process cash payment'
-    });
-  }
-};
+    await session.commitTransaction();
 
-// Process wallet payment
-export const processWalletPayment = async (req, res) => {
-  try {
-    const { bookingId, amount } = req.body;
-    const userId = req.user._id;
-
-    // Check user wallet (this would be a user wallet, not rider wallet)
-    const userWallet = await UserWallet.findOne({ userId });
-    if (!userWallet || userWallet.balance < amount) {
-      return res.status(400).json({
-        success: false,
-        message: 'Insufficient wallet balance'
-      });
-    }
-
-    const booking = await Booking.findOne({
-      _id: bookingId,
-      userId,
-      bookingStatus: { $in: ['COMPLETED', 'ONGOING'] }
-    });
-
-    if (!booking) {
-      return res.status(404).json({
-        success: false,
-        message: 'Booking not found'
-      });
-    }
-
-    // Validate amount
-    const maxAmount = booking.pendingAmount || booking.finalFare || booking.estimatedFare;
-    if (amount <= 0 || amount > maxAmount) {
-      return res.status(400).json({
-        success: false,
-        message: `Invalid amount. Maximum allowed: ₹${maxAmount}`
-      });
-    }
-
-    // Deduct from user wallet
-    userWallet.balance -= amount;
-    await userWallet.save();
-
-    // Create wallet payment record
-    const payment = await Payment.create({
-      bookingId,
-      userId,
-      amount,
-      paymentMethod: 'WALLET',
-      paymentType: amount >= maxAmount ? 'FULL' : 'PARTIAL',
-      paymentStatus: 'SUCCESS',
-      currency: 'INR',
-      description: `Wallet payment for booking #${bookingId}`,
-      metadata: {
-        walletBalanceBefore: userWallet.balance + amount,
-        walletBalanceAfter: userWallet.balance
-      }
-    });
-
-    // Update booking
-    booking.paidAmount += amount;
-    booking.pendingAmount = Math.max(0, maxAmount - booking.paidAmount);
-    await booking.save();
-
-    res.status(200).json({
+    res.json({
       success: true,
       message: 'Wallet payment successful',
       data: {
         payment,
-        newWalletBalance: userWallet.balance
+        walletBalance: wallet.balance
       }
     });
   } catch (error) {
-    console.error('Process wallet payment error:', error);
+    await session.abortTransaction();
+    console.error('Wallet payment error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to process wallet payment'
+      message: 'Error processing wallet payment'
     });
+  } finally {
+    session.endSession();
   }
 };
 
-// Initiate refund
-export const initiateRefund = async (req, res) => {
+// @desc    Get payment details
+// @route   GET /api/payments/:id
+// @access  Private
+export const getPaymentDetails = async (req, res) => {
   try {
-    const { paymentId, refundAmount, reason } = req.body;
+    const { id } = req.params;
     const userId = req.user._id;
 
-    // Check if user is admin
-    if (req.user.role !== 'ADMIN') {
-      return res.status(403).json({
-        success: false,
-        message: 'Only admin can initiate refunds'
-      });
-    }
+    const payment = await Payment.findById(id)
+      .populate('bookingId', 'pickup drop distanceKm estimatedFare bookingStatus')
+      .populate('userId', 'name email phone');
 
-    const payment = await Payment.findById(paymentId);
     if (!payment) {
       return res.status(404).json({
         success: false,
@@ -545,252 +419,350 @@ export const initiateRefund = async (req, res) => {
       });
     }
 
-    // Validate refund amount
-    if (refundAmount <= 0 || refundAmount > payment.amount) {
-      return res.status(400).json({
+    // Check authorization
+    if (payment.userId._id.toString() !== userId.toString() && req.user.role !== 'ADMIN') {
+      return res.status(403).json({
         success: false,
-        message: `Invalid refund amount. Maximum: ₹${payment.amount}`
+        message: 'Not authorized to view this payment'
       });
     }
 
-    // Process refund through Razorpay
-    let razorpayRefund;
-    if (payment.paymentMethod === 'RAZORPAY' && payment.razorpayPaymentId) {
-      try {
-        razorpayRefund = await razorpay.payments.refund(
-          payment.razorpayPaymentId,
-          {
-            amount: Math.round(refundAmount * 100),
-            notes: {
-              reason,
-              refundBy: userId.toString()
-            }
-          }
-        );
-      } catch (razorpayError) {
-        console.error('Razorpay refund error:', razorpayError);
-        return res.status(400).json({
-          success: false,
-          message: 'Failed to process refund through Razorpay'
-        });
-      }
-    }
-
-    // Update payment record
-    payment.refundAmount = refundAmount;
-    payment.refundReason = reason;
-    payment.refundedAt = new Date();
-    payment.paymentStatus = refundAmount === payment.amount ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
-    payment.metadata.refund = razorpayRefund || { manual: true };
-    await payment.save();
-
-    // Update booking if needed
-    const booking = await Booking.findById(payment.bookingId);
-    if (booking) {
-      booking.paidAmount -= refundAmount;
-      booking.pendingAmount += refundAmount;
-      await booking.save();
-    }
-
-    // Create notification for user
-    await Notification.create({
-      userId: payment.userId,
-      bookingId: payment.bookingId,
-      type: 'PAYMENT_REFUND',
-      title: 'Payment Refunded',
-      message: `Refund of ₹${refundAmount} processed for your payment`,
-      data: {
-        refundAmount,
-        reason,
-        paymentId: payment._id
-      }
-    });
-
-    res.status(200).json({
+    res.json({
       success: true,
-      message: 'Refund initiated successfully',
-      data: {
-        payment,
-        refundId: razorpayRefund?.id
-      }
+      data: payment
     });
   } catch (error) {
-    console.error('Initiate refund error:', error);
+    console.error('Get payment details error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to initiate refund'
+      message: 'Error fetching payment details'
     });
   }
 };
 
-// Get payment history
-export const getPaymentHistory = async (req, res) => {
+// @desc    Get user payments
+// @route   GET /api/payments/user/my-payments
+// @access  Private (User)
+export const getUserPayments = async (req, res) => {
   try {
     const userId = req.user._id;
-    const { 
-      startDate, 
-      endDate, 
-      status, 
-      paymentMethod,
-      page = 1, 
-      limit = 20 
-    } = req.query;
+    const { page = 1, limit = 10 } = req.query;
 
-    const query = { userId };
-    
-    // Date filter
-    if (startDate && endDate) {
-      query.createdAt = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate)
-      };
-    }
-    
-    // Status filter
-    if (status) {
-      query.paymentStatus = status;
-    }
-    
-    // Payment method filter
-    if (paymentMethod) {
-      query.paymentMethod = paymentMethod;
-    }
-
-    const payments = await Payment.find(query)
-      .populate('bookingId', 'pickup drop bookingStatus')
+    const payments = await Payment.find({ userId })
+      .populate('bookingId', 'pickup drop distanceKm bookingStatus')
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(parseInt(limit));
 
-    const total = await Payment.countDocuments(query);
+    const total = await Payment.countDocuments({ userId });
 
-    // Calculate totals
-    const totals = await Payment.aggregate([
-      { $match: query },
-      { 
-        $group: {
-          _id: null,
-          totalAmount: { $sum: "$amount" },
-          totalRefunds: { $sum: "$refundAmount" },
-          count: { $sum: 1 }
-        }
-      }
-    ]);
-
-    res.status(200).json({
+    res.json({
       success: true,
       data: {
         payments,
-        summary: totals[0] || {
-          totalAmount: 0,
-          totalRefunds: 0,
-          count: 0
-        },
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
           total,
-          totalPages: Math.ceil(total / limit)
+          pages: Math.ceil(total / limit)
         }
       }
     });
   } catch (error) {
-    console.error('Get payment history error:', error);
+    console.error('Get user payments error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to get payment history'
+      message: 'Error fetching payments'
     });
   }
 };
 
-// Razorpay webhook handler
-export const razorpayWebhook = async (req, res) => {
+// @desc    Process refund
+// @route   POST /api/payments/:id/refund
+// @access  Private (Admin)
+export const processRefund = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
-    const signature = req.headers['x-razorpay-signature'];
-    const body = JSON.stringify(req.body);
+    const { id } = req.params;
+    const { amount, reason } = req.body;
+    const adminId = req.user._id;
 
-    // Verify webhook signature
-    const expectedSignature = crypto
-      .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
-      .update(body)
-      .digest('hex');
+    // Find payment
+    const payment = await Payment.findById(id).session(session);
 
-    if (signature !== expectedSignature) {
-      console.error('Invalid webhook signature');
-      return res.status(400).send('Invalid signature');
+    if (!payment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payment not found'
+      });
     }
 
-    const event = req.body.event;
-    const payload = req.body.payload;
-
-    switch (event) {
-      case 'payment.captured':
-        await handlePaymentCaptured(payload.payment.entity);
-        break;
-      
-      case 'payment.failed':
-        await handlePaymentFailed(payload.payment.entity);
-        break;
-      
-      case 'refund.created':
-        await handleRefundCreated(payload.refund.entity);
-        break;
-      
-      default:
-        console.log(`Unhandled webhook event: ${event}`);
+    // Check if refundable
+    if (payment.paymentStatus !== 'SUCCESS') {
+      return res.status(400).json({
+        success: false,
+        message: 'Only successful payments can be refunded'
+      });
     }
 
-    res.status(200).send('OK');
+    if (payment.refundAmount >= payment.amount) {
+      return res.status(400).json({
+        success: false,
+        message: 'Payment already fully refunded'
+      });
+    }
+
+    const refundAmount = amount || (payment.amount - payment.refundAmount);
+
+    // Process refund via Razorpay
+    if (payment.paymentMethod === 'RAZORPAY' && payment.razorpayPaymentId) {
+      const refund = await refundPayment(
+        payment.razorpayPaymentId,
+        refundAmount,
+        { reason, initiatedBy: adminId.toString() }
+      );
+
+      payment.metadata.refundDetails = refund;
+    }
+
+    // Update payment
+    payment.refundAmount += refundAmount;
+    payment.refundReason = reason;
+    payment.refundedAt = new Date();
+    
+    if (payment.refundAmount >= payment.amount) {
+      payment.paymentStatus = 'REFUNDED';
+    } else {
+      payment.paymentStatus = 'PARTIALLY_REFUNDED';
+    }
+    
+    await payment.save({ session });
+
+    // If refund is for a cancelled booking, update booking
+    const booking = await Booking.findById(payment.bookingId).session(session);
+    if (booking && booking.bookingStatus === 'CANCELLED') {
+      // Add to user wallet if needed
+      const wallet = await UserWallet.findOne({ userId: payment.userId }).session(session);
+      if (wallet) {
+        wallet.balance += refundAmount;
+        wallet.transactions.push({
+          type: 'CREDIT',
+          amount: refundAmount,
+          description: `Refund for cancelled booking ${booking._id}`,
+          referenceId: booking._id,
+          referenceModel: 'Booking'
+        });
+        await wallet.save({ session });
+      }
+    }
+
+    // Create notification
+    const notification = new Notification({
+      userId: payment.userId,
+      bookingId: payment.bookingId,
+      type: 'REFUND_PROCESSED',
+      title: 'Refund Processed',
+      message: `Refund of ₹${refundAmount} has been processed${reason ? ` for: ${reason}` : ''}`,
+      data: {
+        paymentId: payment._id,
+        refundAmount,
+        reason
+      }
+    });
+    await notification.save({ session });
+
+    await session.commitTransaction();
+
+    res.json({
+      success: true,
+      message: 'Refund processed successfully',
+      data: payment
+    });
   } catch (error) {
-    console.error('Webhook error:', error);
-    res.status(500).send('Webhook error');
+    await session.abortTransaction();
+    console.error('Process refund error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error processing refund'
+    });
+  } finally {
+    session.endSession();
   }
 };
 
-// Webhook handlers
-const handlePaymentCaptured = async (payment) => {
-  // Find payment by razorpay payment id
-  const existingPayment = await Payment.findOne({
-    razorpayPaymentId: payment.id
-  });
+// @desc    Get payment statistics
+// @route   GET /api/payments/admin/stats
+// @access  Private (Admin)
+export const getPaymentStats = async (req, res) => {
+  try {
+    const stats = await Payment.aggregate([
+      {
+        $group: {
+          _id: '$paymentStatus',
+          count: { $sum: 1 },
+          totalAmount: { $sum: '$amount' },
+          totalRefund: { $sum: '$refundAmount' }
+        }
+      }
+    ]);
 
-  if (existingPayment) {
-    existingPayment.paymentStatus = 'SUCCESS';
-    existingPayment.metadata.webhook = payment;
-    await existingPayment.save();
+    const totalPayments = await Payment.countDocuments();
+    const totalRevenue = await Payment.aggregate([
+      { $match: { paymentStatus: 'SUCCESS' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const todayPayments = await Payment.countDocuments({
+      createdAt: { $gte: today }
+    });
+
+    const todayRevenue = await Payment.aggregate([
+      {
+        $match: {
+          paymentStatus: 'SUCCESS',
+          createdAt: { $gte: today }
+        }
+      },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        summary: {
+          totalPayments,
+          totalRevenue: totalRevenue[0]?.total || 0,
+          todayPayments,
+          todayRevenue: todayRevenue[0]?.total || 0
+        },
+        breakdown: stats
+      }
+    });
+  } catch (error) {
+    console.error('Get payment stats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching payment statistics'
+    });
+  }
+};
+
+// @desc    Webhook handler for Razorpay
+// @route   POST /webhook/razorpay
+// @access  Public
+export const razorpayWebhook = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    const signature = req.headers['x-razorpay-signature'];
+
+    // Verify webhook signature (implement if needed)
+    // const isValid = verifyWebhookSignature(req.body, signature, webhookSecret);
+    // if (!isValid) {
+    //   return res.status(400).json({ success: false });
+    // }
+
+    const event = req.body;
+
+    switch (event.event) {
+      case 'payment.captured':
+        await handlePaymentCaptured(event.payload.payment.entity, session);
+        break;
+        
+      case 'payment.failed':
+        await handlePaymentFailed(event.payload.payment.entity, session);
+        break;
+        
+      case 'refund.created':
+      case 'refund.processed':
+        await handleRefundProcessed(event.payload.refund.entity, session);
+        break;
+        
+      default:
+        console.log(`Unhandled webhook event: ${event.event}`);
+    }
+
+    await session.commitTransaction();
+
+    res.json({ success: true });
+  } catch (error) {
+    await session.abortTransaction();
+    console.error('Webhook error:', error);
+    res.status(500).json({ success: false });
+  } finally {
+    session.endSession();
+  }
+};
+
+// Helper functions for webhook handling
+const handlePaymentCaptured = async (paymentEntity, session) => {
+  const payment = await Payment.findOne({
+    razorpayOrderId: paymentEntity.order_id
+  }).session(session);
+
+  if (payment && payment.paymentStatus !== 'SUCCESS') {
+    payment.razorpayPaymentId = paymentEntity.id;
+    payment.paymentStatus = 'SUCCESS';
+    payment.metadata.razorpayResponse = paymentEntity;
+    await payment.save({ session });
 
     // Update booking
-    const booking = await Booking.findById(existingPayment.bookingId);
+    const booking = await Booking.findById(payment.bookingId).session(session);
     if (booking) {
-      booking.paidAmount += existingPayment.amount;
-      booking.pendingAmount = Math.max(0, booking.estimatedFare - booking.paidAmount);
-      await booking.save();
+      booking.paymentStatus = 'PAID';
+      if (booking.bookingStatus === 'INITIATED') {
+        booking.bookingStatus = 'SEARCHING_DRIVER';
+      }
+      await booking.save({ session });
     }
   }
 };
 
-const handlePaymentFailed = async (payment) => {
-  const existingPayment = await Payment.findOne({
-    razorpayPaymentId: payment.id
-  });
+const handlePaymentFailed = async (paymentEntity, session) => {
+  const payment = await Payment.findOne({
+    razorpayOrderId: paymentEntity.order_id
+  }).session(session);
 
-  if (existingPayment) {
-    existingPayment.paymentStatus = 'FAILED';
-    existingPayment.metadata.webhook = payment;
-    await existingPayment.save();
+  if (payment) {
+    payment.paymentStatus = 'FAILED';
+    payment.metadata.errorDetails = paymentEntity.error_description;
+    await payment.save({ session });
+
+    // Create notification
+    const notification = new Notification({
+      userId: payment.userId,
+      bookingId: payment.bookingId,
+      type: 'PAYMENT_FAILED',
+      title: 'Payment Failed',
+      message: `Payment failed: ${paymentEntity.error_description || 'Please try again'}`,
+      data: { paymentId: payment._id }
+    });
+    await notification.save({ session });
   }
 };
 
-const handleRefundCreated = async (refund) => {
+const handleRefundProcessed = async (refundEntity, session) => {
   const payment = await Payment.findOne({
-    razorpayPaymentId: refund.payment_id
-  });
+    razorpayPaymentId: refundEntity.payment_id
+  }).session(session);
 
   if (payment) {
-    payment.refundAmount = refund.amount / 100;
-    payment.refundedAt = new Date(refund.created_at * 1000);
-    payment.paymentStatus = refund.amount === payment.amount ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
-    payment.metadata.refund = refund;
-    await payment.save();
+    payment.refundAmount += refundEntity.amount / 100; // Convert from paise
+    payment.refundedAt = new Date();
+    
+    if (payment.refundAmount >= payment.amount) {
+      payment.paymentStatus = 'REFUNDED';
+    } else {
+      payment.paymentStatus = 'PARTIALLY_REFUNDED';
+    }
+    
+    await payment.save({ session });
   }
 };

@@ -20,6 +20,7 @@ import {
   getNearbyRidersForCustomers,
   debugBookingStatus,
   getRiderById,
+  getActiveBooking,
   // resetAllRidersAndCabs
 } from '../controllers/riderController.js';
 import { authenticate, authorize } from '../middleware/authMiddleware.js';
@@ -49,6 +50,7 @@ router.put('/profile', updateRiderProfile);
 router.put('/location', updateRiderLocation);
 router.put('/online-status', toggleOnlineStatus);
 router.put('/cab', uploadCabDocuments, handleUploadError, updateCabDetails);
+router.get('/active-booking', getActiveBooking);
 
 // ----- Parameterized route – must be AFTER all specific GET routes -----
 router.get('/:id', getRiderById);
@@ -59,7 +61,7 @@ router.use(authorize('RIDER'));
 // Booking routes (rider only)
 router.post('/bookings/accept', acceptBookingRequest);
 router.post('/bookings/:bookingId/reject', rejectBookingRequest);
-// router.post('/bookings/:bookingId/start', startRide);
+router.post('/bookings/:bookingId/start', startRide);
 router.post('/bookings/:bookingId/complete', completeRide);
 router.post('/bookings/update-status', updateTripStatus);
 

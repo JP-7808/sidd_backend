@@ -353,7 +353,7 @@ export const registerRider = async (req, res) => {
       aadhaarNumber,
       drivingLicenseNumber,
       approvalStatus: 'PENDING',
-      availabilityStatus: 'INACTIVE',
+      availabilityStatus: 'OFFLINE',
       isOnline: false,
       tokenVersion: 0
     });

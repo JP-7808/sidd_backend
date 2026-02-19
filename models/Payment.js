@@ -1,3 +1,4 @@
+// models/Payment.js
 import mongoose from "mongoose";
 
 const paymentSchema = new mongoose.Schema({
@@ -13,7 +14,6 @@ const paymentSchema = new mongoose.Schema({
     required: true 
   },
 
-  // Razorpay
   razorpayOrderId: String,
   razorpayPaymentId: String,
   razorpaySignature: String,
@@ -26,7 +26,7 @@ const paymentSchema = new mongoose.Schema({
 
   paymentMethod: {
     type: String,
-    enum: ["RAZORPAY", "CASH", "WALLET"],
+    enum: ["RAZORPAY", "CASH", "WALLET", "ONLINE"],
     required: true
   },
 
@@ -38,11 +38,19 @@ const paymentSchema = new mongoose.Schema({
 
   paymentStatus: {
     type: String,
-    enum: ["PENDING", "SUCCESS", "FAILED", "REFUNDED", "PARTIALLY_REFUNDED"],
+    enum: [
+      "PENDING",
+      "SUCCESS",
+      "FAILED",
+      "REFUNDED",
+      "PARTIALLY_REFUNDED",
+      "PENDING_SETTLEMENT",
+      "SETTLED",
+      "PENDING_PAYOUT"
+    ],
     default: "PENDING"
   },
 
-  // Payment Details
   currency: {
     type: String,
     default: "INR"
@@ -52,7 +60,6 @@ const paymentSchema = new mongoose.Schema({
   
   invoiceId: String,
 
-  // Refunds
   refundAmount: {
     type: Number,
     default: 0
@@ -61,6 +68,21 @@ const paymentSchema = new mongoose.Schema({
   refundReason: String,
   
   refundedAt: Date,
+
+  settlementDueDate: Date,
+  settledAt: Date,
+  collectedBy: {
+    type: String,
+    enum: ["RIDER", "ADMIN", "SYSTEM"]
+  },
+  collectedById: {
+    type: mongoose.Schema.Types.ObjectId,
+    refPath: 'collectedByModel'
+  },
+  collectedByModel: {
+    type: String,
+    enum: ["Rider", "User", "Admin"]
+  },
 
   metadata: {
     type: mongoose.Schema.Types.Mixed,
@@ -82,5 +104,9 @@ paymentSchema.index({ bookingId: 1 });
 paymentSchema.index({ userId: 1 });
 paymentSchema.index({ razorpayPaymentId: 1 });
 paymentSchema.index({ paymentStatus: 1 });
+paymentSchema.index({ settlementDueDate: 1 });
 
-export default mongoose.model("Payment", paymentSchema);
+// Check if model already exists before creating
+const Payment = mongoose.models.Payment || mongoose.model("Payment", paymentSchema);
+
+export default Payment;

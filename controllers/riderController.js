@@ -103,37 +103,37 @@ export const updateRiderLocation = async (req, res) => {
     // Update current location in rider document
     await Rider.findByIdAndUpdate(riderId, {
       currentLocation: {
-        type: "Point",
-        coordinates: [lng, lat],
-      },
+        type: 'Point',
+        coordinates: [lng, lat]
+      }
     });
 
     // Update live location for tracking
     await LiveLocation.findOneAndUpdate(
       { riderId },
       { lat, lng, updatedAt: new Date() },
-      { upsert: true },
+      { upsert: true }
     );
 
     // Update rider activity
     await RiderActivity.findOneAndUpdate(
       { riderId },
-      {
+      { 
         lastLocation: { lat, lng },
-        lastSeenAt: new Date(),
+        lastSeenAt: new Date()
       },
-      { upsert: true },
+      { upsert: true }
     );
 
     res.status(200).json({
       success: true,
-      message: "Location updated successfully",
+      message: 'Location updated successfully'
     });
   } catch (error) {
-    console.error("Update rider location error:", error);
+    console.error('Update rider location error:', error);
     res.status(500).json({
       success: false,
-      message: "Failed to update location",
+      message: 'Failed to update location'
     });
   }
 };
@@ -150,16 +150,30 @@ export const toggleOnlineStatus = async (req, res) => {
     const riderId = req.user._id;
     const { isOnline } = req.body;
 
+    console.log('========== TOGGLE ONLINE STATUS ==========');
+    console.log('Rider ID:', riderId);
+    console.log('Requested status:', isOnline ? 'ONLINE' : 'OFFLINE');
+
     const rider = await Rider.findById(riderId).session(session);
     if (!rider) {
       await session.abortTransaction();
-      return res
-        .status(404)
-        .json({ success: false, message: "Rider not found" });
+      return res.status(404).json({ 
+        success: false, 
+        message: "Rider not found" 
+      });
     }
+
+    console.log('Current rider status:', {
+      isOnline: rider.isOnline,
+      availabilityStatus: rider.availabilityStatus,
+      currentBooking: rider.currentBooking,
+      isLocked: rider.isLocked,
+      lockedUntil: rider.lockedUntil
+    });
 
     // ----- Going OFFLINE -----
     if (isOnline === false) {
+      // Check if rider has an active trip
       if (rider.currentBooking) {
         const activeBooking = await Booking.findOne({
           _id: rider.currentBooking,
@@ -169,6 +183,7 @@ export const toggleOnlineStatus = async (req, res) => {
         }).session(session);
 
         if (activeBooking) {
+          console.log('Cannot go offline - active trip found:', activeBooking._id);
           await session.abortTransaction();
           return res.status(400).json({
             success: false,
@@ -176,18 +191,51 @@ export const toggleOnlineStatus = async (req, res) => {
           });
         }
       }
+      
+      // Update to offline
       rider.isOnline = false;
       rider.availabilityStatus = "OFFLINE";
+      rider.socketId = null; // Clear socket ID when going offline
+      
+      console.log('Rider set to OFFLINE');
     }
 
     // ----- Going ONLINE -----
     if (isOnline === true) {
+      // Check if rider is approved
+      if (rider.approvalStatus !== 'APPROVED') {
+        await session.abortTransaction();
+        return res.status(400).json({
+          success: false,
+          message: `Cannot go online. Account is ${rider.approvalStatus.toLowerCase()}`,
+        });
+      }
+
+      // Check if rider has an approved cab
+      const cab = await Cab.findOne({ 
+        riderId, 
+        isApproved: true 
+      }).session(session);
+
+      if (!cab) {
+        await session.abortTransaction();
+        return res.status(400).json({
+          success: false,
+          message: "Cannot go online. No approved cab found.",
+        });
+      }
+
       // 1️⃣ Clean up stale currentBooking
       if (rider.currentBooking) {
+        console.log('Checking stale booking:', rider.currentBooking);
+        
         const existingBooking = await Booking.findById(
           rider.currentBooking,
         ).session(session);
+        
         if (!existingBooking) {
+          // Booking doesn't exist anymore
+          console.log('Stale booking - booking not found, clearing reference');
           rider.currentBooking = null;
           rider.isLocked = false;
           rider.lockedUntil = null;
@@ -197,26 +245,72 @@ export const toggleOnlineStatus = async (req, res) => {
             "DRIVER_ARRIVED",
             "TRIP_STARTED",
           ];
+          
           if (!activeStatuses.includes(existingBooking.bookingStatus)) {
+            // Booking exists but is not active (completed, cancelled, etc.)
+            console.log('Stale booking - booking not active, clearing reference');
             rider.currentBooking = null;
             rider.isLocked = false;
             rider.lockedUntil = null;
+          } else {
+            // Booking is still active, cannot go online
+            console.log('Active booking found - cannot go online');
+            await session.abortTransaction();
+            return res.status(400).json({
+              success: false,
+              message: "Cannot go online. You have an active trip.",
+            });
           }
         }
       }
 
-      // 2️⃣ Reset locks
-      rider.isLocked = false;
-      rider.lockedUntil = null;
+      // 2️⃣ Check if rider is locked
+      if (rider.isLocked && rider.lockedUntil) {
+        const now = new Date();
+        if (now < rider.lockedUntil) {
+          const minutesLeft = Math.round((rider.lockedUntil - now) / (1000 * 60));
+          console.log(`Rider is locked for ${minutesLeft} more minutes`);
+          await session.abortTransaction();
+          return res.status(400).json({
+            success: false,
+            message: `Cannot go online. Account is locked for ${minutesLeft} more minutes.`,
+          });
+        } else {
+          // Lock expired
+          rider.isLocked = false;
+          rider.lockedUntil = null;
+        }
+      }
 
-      // 3️⃣ Set online
+      // 3️⃣ Check for any pending booking requests that might have expired
+      // This is optional but good for cleanup
+      await BookingRequest.updateMany(
+        {
+          riderId,
+          status: 'PENDING',
+          expiresAt: { $lt: new Date() }
+        },
+        {
+          status: 'EXPIRED'
+        },
+        { session }
+      );
+
+      // 4️⃣ Set online
       rider.isOnline = true;
       rider.availabilityStatus = "AVAILABLE";
       rider.socketId = req.body.socketId || rider.socketId;
+      
+      console.log('Rider set to ONLINE with socket ID:', rider.socketId);
     }
 
     await rider.save({ session });
     await session.commitTransaction();
+
+    console.log('✅ Toggle successful. New status:', {
+      isOnline: rider.isOnline,
+      availabilityStatus: rider.availabilityStatus
+    });
 
     res.status(200).json({
       success: true,
@@ -226,12 +320,14 @@ export const toggleOnlineStatus = async (req, res) => {
         availabilityStatus: rider.availabilityStatus,
       },
     });
+
   } catch (error) {
     await session.abortTransaction();
-    console.error("Toggle online status error:", error);
+    console.error("❌ Toggle online status error:", error);
     res.status(500).json({
       success: false,
       message: "Failed to update online status",
+      error: error.message
     });
   } finally {
     session.endSession();
@@ -239,360 +335,710 @@ export const toggleOnlineStatus = async (req, res) => {
 };
 
 // Get available bookings - Simplified and error-free
+// controllers/riderController.js - Updated getAvailableBookings
+
 export const getAvailableBookings = async (req, res) => {
   try {
-    const rider = req.user;
+    const riderId = req.user._id;
+    const { lat, lng, radius = 10 } = req.query;
 
-    if (!rider.isOnline || !['AVAILABLE', 'ACTIVE'].includes(rider.availabilityStatus)) {
-      return res.status(200).json({ success: true, data: [] });
-    }
+    console.log('========== GET AVAILABLE BOOKINGS ==========');
+    console.log(`Rider ID: ${riderId}`);
+    console.log(`Location: lat=${lat}, lng=${lng}, radius=${radius}`);
 
-    const cab = await Cab.findOne({
-      riderId: rider._id,
-      isApproved: true,
+    // 1. Find all pending requests for this rider that haven't expired
+    const pendingRequests = await BookingRequest.find({
+      riderId,
+      status: 'PENDING',
+      expiresAt: { $gt: new Date() }
     });
 
-    if (!cab) {
-      return res.status(200).json({ success: true, data: [] });
+    console.log(`Found ${pendingRequests.length} pending requests:`, 
+      pendingRequests.map(r => ({ 
+        bookingId: r.bookingId, 
+        expiresAt: r.expiresAt 
+      }))
+    );
+
+    const bookingIds = pendingRequests.map(req => req.bookingId);
+
+    if (bookingIds.length === 0) {
+      console.log('No pending requests found');
+      return res.json({
+        success: true,
+        data: []
+      });
     }
 
-    /**
-     * ✅ IMPORTANT FIX:
-     * - broadcastExpiry respected
-     * - cron will NOT kill active rides early
-     */
+    // 2. Get the actual bookings with populated user data
+    console.log('Looking for bookings with IDs:', bookingIds);
+    console.log('Booking status filter:', ['INITIATED', 'SEARCHING_DRIVER']);
+
     const bookings = await Booking.find({
-      bookingStatus: "SEARCHING_DRIVER",
-      vehicleType: cab.cabType,
-      isBroadcastActive: true,
-      broadcastExpiry: { $gt: new Date() },
+      _id: { $in: bookingIds },
+      bookingStatus: { $in: ['INITIATED', 'SEARCHING_DRIVER'] }
     })
-      .populate("userId", "name phone")
-      .sort({ createdAt: -1 })
-      .limit(5);
+    .populate('userId', 'name phone rating')
+    .select('pickup drop vehicleType distanceKm estimatedFare bookingStatus createdAt userId');
 
-    return res.status(200).json({
-      success: true,
-      data: bookings,
+    console.log(`Found ${bookings.length} matching bookings:`, 
+      bookings.map(b => ({ 
+        id: b._id, 
+        status: b.bookingStatus,
+        vehicleType: b.vehicleType 
+      }))
+    );
+
+    // If no bookings found, check if bookings exist but with different status
+    if (bookings.length === 0) {
+      const allBookings = await Booking.find({
+        _id: { $in: bookingIds }
+      }).select('_id bookingStatus');
+      
+      console.log('All bookings (regardless of status):', 
+        allBookings.map(b => ({ id: b._id, status: b.bookingStatus }))
+      );
+    }
+
+    // 3. Format the response data
+    const formattedBookings = bookings.map(booking => {
+      const pendingRequest = pendingRequests.find(r => 
+        r.bookingId.toString() === booking._id.toString()
+      );
+
+      return {
+        _id: booking._id,
+        pickup: booking.pickup || {},
+        drop: booking.drop || {},
+        vehicleType: booking.vehicleType,
+        distanceKm: booking.distanceKm || 0,
+        estimatedFare: booking.estimatedFare || 0,
+        bookingStatus: booking.bookingStatus,
+        createdAt: booking.createdAt,
+        customer: booking.userId ? {
+          name: booking.userId.name || 'Customer',
+          phone: booking.userId.phone,
+          rating: booking.userId.rating || 4.5
+        } : {
+          name: 'Customer',
+          rating: 4.5
+        },
+        expiresAt: pendingRequest?.expiresAt || null
+      };
     });
-  } catch (err) {
-    console.error("getAvailableBookings error:", err);
-    res.status(200).json({ success: true, data: [] });
+
+    console.log(`Returning ${formattedBookings.length} formatted bookings`);
+    console.log('========== END GET AVAILABLE BOOKINGS ==========');
+
+    res.json({
+      success: true,
+      data: formattedBookings
+    });
+
+  } catch (error) {
+    console.error('❌ Get available bookings error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching available bookings',
+      error: error.message
+    });
   }
 };
 
 // Accept booking request - UPDATED VERSION
+// controllers/riderController.js - Updated acceptBookingRequest
+
+// controllers/riderController.js - Fixed acceptBookingRequest
+
 export const acceptBookingRequest = async (req, res) => {
-  let retries = 3;
-  while (retries > 0) {
-    const session = await mongoose.startSession();
-    session.startTransaction();
+  const session = await mongoose.startSession();
+  session.startTransaction();
 
-    try {
-      const { bookingId } = req.body;
-      const riderId = req.user._id;
+  try {
+    const { bookingId } = req.body;
+    const riderId = req.user._id;
 
-      if (!mongoose.Types.ObjectId.isValid(bookingId)) {
-        throw new Error("Invalid booking ID");
-      }
+    console.log('========== ACCEPT BOOKING REQUEST ==========');
+    console.log('1. Request received:', { bookingId, riderId });
+    console.log('2. Request body:', req.body);
+    console.log('3. User:', req.user);
 
-      const booking = await Booking.findOne({
-        _id: bookingId,
-        bookingStatus: "SEARCHING_DRIVER",
-        isBroadcastActive: true
-      }).session(session);
-
-      if (!booking) throw new Error("Booking no longer available");
-
-      const rider = await Rider.findById(riderId).session(session);
-      if (!rider || !rider.isOnline || !['AVAILABLE', 'ACTIVE'].includes(rider.availabilityStatus)) {
-        throw new Error("Rider not available");
-      }
-
-      // Clean up stale currentBooking
-      if (rider.currentBooking) {
-        const existingBooking = await Booking.findById(rider.currentBooking).session(session);
-        if (!existingBooking) {
-          rider.currentBooking = null;
-        } else {
-          const activeStatuses = ["DRIVER_ASSIGNED", "DRIVER_ARRIVED", "TRIP_STARTED"];
-          if (!activeStatuses.includes(existingBooking.bookingStatus)) {
-            rider.currentBooking = null;
-          } else {
-            throw new Error("You already have an active ride");
-          }
-        }
-      }
-
-      const cab = await Cab.findOne({
-        riderId,
-        isApproved: true,
-        cabType: booking.vehicleType
-      }).session(session);
-      if (!cab) throw new Error("Cab not approved or vehicle mismatch");
-
-      cab.isAvailable = false;
-      await cab.save({ session });
-
-      booking.bookingStatus = "DRIVER_ASSIGNED";
-      booking.riderId = riderId;
-      booking.cabId = cab._id;
-      booking.isBroadcastActive = false;
-      booking.acceptedAt = new Date();
-      await booking.save({ session });
-
-      rider.currentBooking = booking._id;
-      rider.isLocked = false;
-      rider.lockedUntil = null;
-      rider.availabilityStatus = "ON_TRIP";
-      await rider.save({ session });
-
-      await BookingRequest.findOneAndUpdate(
-        { bookingId, riderId },
-        { status: "ACCEPTED", responseTime: new Date() },
-        { upsert: true, session }
-      );
-
-      await session.commitTransaction();
-      session.endSession();
-
-      // Notify user via WebSocket
-      try {
-        const io = req.app.get('io');
-        if (io) {
-          io.to(`booking-${booking._id}`).emit('ride-accepted', {
-            bookingId: booking._id,
-            rider: {
-              id: rider._id,
-              name: rider.name,
-              phone: rider.phone,
-              rating: rider.overallRating || 4.5,
-              photo: rider.photo,
-              vehicle: {
-                model: cab.cabModel,
-                number: cab.cabNumber,
-                type: cab.cabType
-              }
-            },
-            estimatedArrival: 5
-          });
-          console.log(`📢 Emitted ride-accepted to booking-${booking._id}`);
-        }
-      } catch (socketError) {
-        console.error('Socket emit error:', socketError);
-      }
-
-      return res.status(200).json({
-        success: true,
-        message: "Booking accepted",
-        data: { bookingId: booking._id, otp: booking.otp }
-      });
-
-    } catch (error) {
+    // Validate bookingId
+    if (!bookingId) {
+      console.log('❌ ERROR: Booking ID is missing');
       await session.abortTransaction();
-      session.endSession();
-
-      if (error.message.includes('WriteConflict') && retries > 0) {
-        retries--;
-        console.log(`⚠️ Write conflict, retrying... (${retries} attempts left)`);
-        continue;
-      }
-
-      console.error("Accept booking error:", error.message);
-      return res.status(400).json({ success: false, message: error.message });
+      return res.status(400).json({
+        success: false,
+        message: 'Booking ID is required'
+      });
     }
+
+    // Validate MongoDB ObjectId
+    if (!mongoose.Types.ObjectId.isValid(bookingId)) {
+      console.log('❌ ERROR: Invalid Booking ID format:', bookingId);
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid booking ID format'
+      });
+    }
+
+    // 1. Find the booking request
+    console.log('4. Looking for booking request...');
+    const bookingRequest = await BookingRequest.findOne({
+      bookingId,
+      riderId,
+      status: 'PENDING'
+    }).session(session);
+
+    if (!bookingRequest) {
+      console.log('❌ ERROR: No pending booking request found');
+      console.log('   - Searched for:', { bookingId, riderId, status: 'PENDING' });
+      
+      // Check if request exists with different status
+      const otherRequest = await BookingRequest.findOne({
+        bookingId,
+        riderId
+      }).session(session);
+      
+      if (otherRequest) {
+        console.log('   - Found request with different status:', otherRequest.status);
+      }
+      
+      await session.abortTransaction();
+      return res.status(404).json({
+        success: false,
+        message: 'No pending booking request found'
+      });
+    }
+
+    console.log('5. Found booking request:', {
+      id: bookingRequest._id,
+      status: bookingRequest.status,
+      expiresAt: bookingRequest.expiresAt
+    });
+
+    // 2. Check if request has expired
+    const now = new Date();
+    if (now > bookingRequest.expiresAt) {
+      console.log('❌ ERROR: Booking request expired');
+      console.log('   - Expires at:', bookingRequest.expiresAt);
+      console.log('   - Current time:', now);
+      
+      bookingRequest.status = 'EXPIRED';
+      await bookingRequest.save({ session });
+      await session.commitTransaction();
+      
+      return res.status(400).json({
+        success: false,
+        message: 'Booking request has expired'
+      });
+    }
+
+    // 3. Get the booking details
+    console.log('6. Looking for booking:', bookingId);
+    const booking = await Booking.findById(bookingId).session(session);
+    
+    if (!booking) {
+      console.log('❌ ERROR: Booking not found');
+      await session.abortTransaction();
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found'
+      });
+    }
+
+    console.log('7. Found booking:', {
+      id: booking._id,
+      status: booking.bookingStatus,
+      vehicleType: booking.vehicleType,
+      hasRider: !!booking.riderId,
+      userId: booking.userId
+    });
+
+    // 4. Check if booking is still available
+    if (!['INITIATED', 'SEARCHING_DRIVER'].includes(booking.bookingStatus)) {
+      console.log(`❌ ERROR: Booking cannot be accepted. Current status: ${booking.bookingStatus}`);
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: `Booking cannot be accepted. Current status: ${booking.bookingStatus}`
+      });
+    }
+
+    if (booking.riderId) {
+      console.log('❌ ERROR: Booking already has a rider assigned:', booking.riderId);
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'Booking already has a rider assigned'
+      });
+    }
+
+    // 5. Get rider's cab
+    console.log('8. Looking for rider\'s cab...');
+    console.log('   - Rider ID:', riderId);
+    console.log('   - Vehicle Type:', booking.vehicleType);
+    
+    const cab = await Cab.findOne({ 
+      riderId, 
+      cabType: booking.vehicleType,
+      isApproved: true,
+      isAvailable: true
+    }).session(session);
+
+    if (!cab) {
+      console.log('❌ ERROR: No available cab found for vehicle type:', booking.vehicleType);
+      
+      // Check if rider has any cab at all
+      const anyCab = await Cab.findOne({ riderId }).session(session);
+      if (anyCab) {
+        console.log('   - Rider has cab but with issues:', {
+          cabType: anyCab.cabType,
+          isApproved: anyCab.isApproved,
+          isAvailable: anyCab.isAvailable
+        });
+      } else {
+        console.log('   - Rider has no cab registered');
+      }
+      
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'No available cab found for this vehicle type'
+      });
+    }
+
+    console.log('9. Found cab:', {
+      id: cab._id,
+      cabNumber: cab.cabNumber,
+      cabType: cab.cabType,
+      isApproved: cab.isApproved,
+      isAvailable: cab.isAvailable
+    });
+
+    // 6. Check if rider is already on another trip
+    console.log('10. Checking for existing active trips...');
+    const existingTrip = await Booking.findOne({
+      riderId,
+      bookingStatus: { $in: ['DRIVER_ASSIGNED', 'DRIVER_ARRIVED', 'TRIP_STARTED'] }
+    }).session(session);
+
+    if (existingTrip) {
+      console.log('❌ ERROR: Rider already has an active trip:', existingTrip._id);
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'You already have an active trip'
+      });
+    }
+
+    console.log('11. No existing active trips found');
+
+    // 7. Update booking with rider and cab details
+    console.log('12. Updating booking...');
+    booking.riderId = riderId;
+    booking.cabId = cab._id;
+    booking.bookingStatus = 'DRIVER_ASSIGNED';
+    booking.acceptedAt = new Date();
+    booking.isBroadcastActive = false;
+    await booking.save({ session });
+    console.log('13. Booking updated successfully');
+
+    // 8. Update the booking request status
+    console.log('14. Updating booking request...');
+    bookingRequest.status = 'ACCEPTED';
+    bookingRequest.responseTime = new Date();
+    await bookingRequest.save({ session });
+    console.log('15. Booking request updated successfully');
+
+    // 9. Reject all other pending requests for this booking
+    console.log('16. Rejecting other pending requests...');
+    const rejectResult = await BookingRequest.updateMany(
+      {
+        bookingId,
+        riderId: { $ne: riderId },
+        status: 'PENDING'
+      },
+      {
+        status: 'REJECTED',
+        responseTime: new Date()
+      },
+      { session }
+    );
+
+    console.log(`17. Rejected ${rejectResult.modifiedCount} other pending requests`);
+
+    // 10. Update rider status
+    console.log('18. Updating rider status...');
+    await Rider.findByIdAndUpdate(
+      riderId,
+      {
+        availabilityStatus: 'ON_TRIP',
+        currentBooking: booking._id,
+        isLocked: true,
+        lockedUntil: new Date(Date.now() + 4 * 60 * 60 * 1000) // 4 hours lock
+      },
+      { session }
+    );
+    console.log('19. Rider status updated');
+
+    // 11. Update cab availability
+    console.log('20. Updating cab availability...');
+    cab.isAvailable = false;
+    await cab.save({ session });
+    console.log('21. Cab availability updated');
+
+    // 12. Get user details for notification
+    console.log('22. Getting user details...');
+    const User = mongoose.model('User');
+    const user = await User.findById(booking.userId).select('name');
+    console.log('23. User found:', user?._id);
+
+    // 13. Create notification for the user
+    console.log('24. Creating user notification...');
+    const Notification = mongoose.model('Notification');
+    const userNotification = new Notification({
+      userId: booking.userId,
+      bookingId: booking._id,
+      type: 'DRIVER_ASSIGNED',
+      title: 'Driver Assigned! 🚗',
+      message: `Driver ${req.user.name} has accepted your booking. They are on the way!`,
+      data: {
+        bookingId: booking._id,
+        riderId,
+        riderName: req.user.name,
+        riderPhone: req.user.phone,
+        cabDetails: {
+          cabNumber: cab.cabNumber,
+          cabModel: cab.cabModel,
+          cabType: cab.cabType
+        }
+      }
+    });
+    await userNotification.save({ session });
+    console.log('25. User notification created');
+
+    await session.commitTransaction();
+    console.log('26. Transaction committed successfully');
+
+    // 14. Emit socket events for real-time updates
+    console.log('27. Emitting socket events...');
+    const io = req.app.get('io');
+    if (io) {
+      // Notify the user
+      io.to(`user-${booking.userId}`).emit('driver-assigned', {
+        bookingId: booking._id,
+        riderId,
+        riderName: req.user.name,
+        riderPhone: req.user.phone,
+        cabDetails: {
+          cabNumber: cab.cabNumber,
+          cabModel: cab.cabModel,
+          cabType: cab.cabType
+        },
+        estimatedArrival: '5-10 minutes'
+      });
+      console.log('   - User notified');
+
+      // Notify other riders that booking is taken
+      if (booking.broadcastedTo && booking.broadcastedTo.length > 0) {
+        booking.broadcastedTo.forEach(broadcastedRiderId => {
+          if (broadcastedRiderId.toString() !== riderId.toString()) {
+            io.to(`rider-${broadcastedRiderId}`).emit('booking-taken', {
+              bookingId: booking._id
+            });
+          }
+        });
+        console.log(`   - Notified ${booking.broadcastedTo.length - 1} other riders`);
+      }
+    }
+
+    // 15. Return success response with the updated booking
+    console.log('28. Fetching populated booking...');
+    const populatedBooking = await Booking.findById(booking._id)
+      .populate('userId', 'name phone')
+      .populate('riderId', 'name phone')
+      .populate('cabId');
+
+    console.log('29. Booking accepted successfully!');
+    console.log('========== END ACCEPT BOOKING REQUEST ==========');
+
+    res.json({
+      success: true,
+      message: 'Booking accepted successfully',
+      data: {
+        booking: populatedBooking,
+        cab,
+        message: 'Please proceed to pickup location'
+      }
+    });
+
+  } catch (error) {
+    await session.abortTransaction();
+    console.error('========== ERROR IN ACCEPT BOOKING ==========');
+    console.error('Error name:', error.name);
+    console.error('Error message:', error.message);
+    console.error('Error stack:', error.stack);
+    
+    // Check for specific error types
+    if (error.name === 'ValidationError') {
+      console.error('Validation Error:', error.errors);
+      return res.status(400).json({
+        success: false,
+        message: 'Validation error',
+        errors: error.errors
+      });
+    }
+    
+    if (error.name === 'CastError') {
+      console.error('Cast Error:', {
+        path: error.path,
+        value: error.value,
+        kind: error.kind
+      });
+      return res.status(400).json({
+        success: false,
+        message: `Invalid ${error.path}: ${error.value}`
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: 'Error accepting booking',
+      error: error.message
+    });
+  } finally {
+    session.endSession();
   }
 };
 
-// Reject booking request - UPDATED VERSION
-// export const rejectBookingRequest = async (req, res) => {
-//   const session = await mongoose.startSession();
-//   session.startTransaction();
-
-//   try {
-//     const { bookingId } = req.params;
-//     const riderId = req.user._id;
-
-//     // Check if booking exists
-//     const booking = await Booking.findById(bookingId).session(session);
-//     if (!booking) {
-//       await session.abortTransaction();
-//       session.endSession();
-//       return res.status(404).json({
-//         success: false,
-//         message: 'Booking not found'
-//       });
-//     }
-
-//     // Create booking request record for rejection
-//     const bookingRequest = new BookingRequest({
-//       bookingId,
-//       riderId,
-//       status: 'REJECTED'
-//       // expiresAt will be set automatically by default
-//     });
-//     await bookingRequest.save({ session });
-
-//     // Increment rider's rejected rides count
-//     await Rider.findByIdAndUpdate(riderId, {
-//       $inc: { rejectedRides: 1 }
-//     }, { session });
-
-//     await session.commitTransaction();
-//     session.endSession();
-
-//     res.status(200).json({
-//       success: true,
-//       message: 'Booking rejected'
-//     });
-//   } catch (error) {
-//     await session.abortTransaction();
-//     session.endSession();
-//     console.error('Reject booking error:', error);
-//     res.status(500).json({
-//       success: false,
-//       message: 'Failed to reject booking',
-//       error: process.env.NODE_ENV === 'development' ? error.message : undefined
-//     });
-//   }
-// };
-
 export const rejectBookingRequest = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { bookingId } = req.params;
     const riderId = req.user._id;
 
-    // Validate ObjectId
-    if (!mongoose.Types.ObjectId.isValid(bookingId)) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid booking ID" });
-    }
+    console.log(`Rider ${riderId} rejecting booking ${bookingId}`);
 
-    console.log("❌ Rejecting booking:", bookingId, "by rider:", riderId);
-
-    // Check if booking exists (optional but recommended)
-    const booking = await Booking.findById(bookingId);
-    if (!booking) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Booking not found" });
-    }
-
-    await BookingRequest.create({
+    // 1. Find the pending booking request
+    const bookingRequest = await BookingRequest.findOne({
       bookingId,
       riderId,
-      status: "REJECTED",
+      status: 'PENDING'
+    }).session(session);
+
+    if (!bookingRequest) {
+      await session.abortTransaction();
+      return res.status(404).json({
+        success: false,
+        message: 'No pending booking request found'
+      });
+    }
+
+    // 2. Update request status to REJECTED
+    bookingRequest.status = 'REJECTED';
+    bookingRequest.responseTime = new Date();
+    await bookingRequest.save({ session });
+
+    // 3. Increment rider's rejected rides count (for performance tracking)
+    await Rider.findByIdAndUpdate(
+      riderId,
+      { $inc: { rejectedRides: 1 } },
+      { session }
+    );
+
+    // 4. Get booking details for potential re-broadcast logic
+    const booking = await Booking.findById(bookingId).session(session);
+    
+    // 5. Check if all riders have rejected this booking
+    if (booking) {
+      const pendingCount = await BookingRequest.countDocuments({
+        bookingId,
+        status: 'PENDING'
+      }).session(session);
+
+      // If no riders are left with pending requests, update booking status
+      if (pendingCount === 0 && booking.bookingStatus === 'SEARCHING_DRIVER') {
+        booking.broadcastRetryCount += 1;
+        
+        if (booking.broadcastRetryCount >= 3) {
+          // Max retries reached, mark as no driver found
+          booking.bookingStatus = 'NO_DRIVER_FOUND';
+          booking.isBroadcastActive = false;
+          
+          // Notify user
+          const notification = new Notification({
+            userId: booking.userId,
+            bookingId: booking._id,
+            type: 'NO_DRIVER_FOUND',
+            title: 'No Drivers Available',
+            message: 'Sorry, no drivers are available at the moment. Please try again.',
+            data: { bookingId: booking._id }
+          });
+          await notification.save({ session });
+        }
+        
+        await booking.save({ session });
+      }
+    }
+
+    await session.commitTransaction();
+
+    res.json({
+      success: true,
+      message: 'Booking rejected successfully',
+      data: {
+        bookingId,
+        rejectedRides: req.user.rejectedRides + 1
+      }
     });
 
-    res.status(200).json({ success: true });
   } catch (error) {
-    console.error("Reject booking error:", error);
-    res.status(500).json({ success: false, message: error.message });
+    await session.abortTransaction();
+    console.error('Reject booking error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error rejecting booking',
+      error: error.message
+    });
+  } finally {
+    session.endSession();
   }
 };
 
 // Start ride
 // In riderController.js - startRide function
 export const startRide = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { bookingId } = req.params;
-    const riderId = req.user._id;
     const { otp } = req.body;
+    const riderId = req.user._id;
 
-    console.log("Start ride request:", { bookingId, riderId, otp });
+    console.log(`Rider ${riderId} starting ride ${bookingId} with OTP: ${otp}`);
 
+    // 1. Find the booking
     const booking = await Booking.findOne({
       _id: bookingId,
-      riderId,
-      bookingStatus: { $in: ["DRIVER_ASSIGNED", "DRIVER_ARRIVED"] },
-    });
-
-    console.log("Found booking:", booking ? "Yes" : "No");
-    if (booking) {
-      console.log("Booking status:", booking.bookingStatus);
-    }
+      riderId
+    }).session(session);
 
     if (!booking) {
-      // Check if booking exists but in wrong status
-      const wrongStatusBooking = await Booking.findOne({
-        _id: bookingId,
-        riderId,
-      });
-
-      if (wrongStatusBooking) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot start ride. Current status: ${wrongStatusBooking.bookingStatus}. Required: DRIVER_ASSIGNED or DRIVER_ARRIVED`,
-        });
-      }
-
+      await session.abortTransaction();
       return res.status(404).json({
         success: false,
-        message: "Booking not found or not assigned to you",
+        message: 'Booking not found or not assigned to you'
       });
     }
 
-    // ✅ FIX: OTP verification - make it case-insensitive
-    if (!otp || booking.otp.toString() !== otp.toString()) {
+    // 2. Check if booking is in correct state to start
+    if (!['DRIVER_ASSIGNED', 'DRIVER_ARRIVED'].includes(booking.bookingStatus)) {
+      await session.abortTransaction();
       return res.status(400).json({
         success: false,
-        message: "Invalid OTP. Please check with customer.",
+        message: `Cannot start ride. Current status: ${booking.bookingStatus}. Required: DRIVER_ASSIGNED or DRIVER_ARRIVED`
       });
     }
 
-    // ✅ FIX: Check OTP expiry with tolerance
+    // 3. Verify OTP
+    if (!otp) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'OTP is required to start the ride'
+      });
+    }
+
+    // Convert both to string for comparison
+    const dbOtp = booking.otp.toString();
+    const requestOtp = otp.toString();
+
+    if (dbOtp !== requestOtp) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid OTP. Please check with customer.'
+      });
+    }
+
+    // 4. Check OTP expiry (allow 5-minute grace period)
     const now = new Date();
     const otpExpiry = new Date(booking.otpExpiresAt);
-    const timeDiff = (otpExpiry - now) / (1000 * 60); // minutes
+    const timeDiffMinutes = (otpExpiry - now) / (1000 * 60);
 
-    if (timeDiff < -5) {
-      // Allow 5-minute grace period
+    if (timeDiffMinutes < -5) {
+      await session.abortTransaction();
       return res.status(400).json({
         success: false,
-        message: "OTP has expired. Please request new OTP from customer.",
+        message: 'OTP has expired. Please request a new OTP from customer.'
       });
     }
 
-    // Update rider status
-    await Rider.findByIdAndUpdate(riderId, {
-      availabilityStatus: "ON_TRIP",
-    });
-
-    console.log("OTP verified successfully, starting ride");
-
-    // Update booking status
-    booking.bookingStatus = "TRIP_STARTED";
+    // 5. Update booking status
+    booking.bookingStatus = 'TRIP_STARTED';
     booking.rideStartTime = new Date();
     booking.otpVerifiedAt = new Date();
-    await booking.save();
-    console.log("Booking updated to TRIP_STARTED");
+    await booking.save({ session });
 
-    // Notify user via socket
-    try {
-      const io = req.app.get("io");
-      if (io) {
-        io.to(booking.userId.toString()).emit("ride-started", {
-          bookingId: booking._id,
-          startTime: booking.rideStartTime,
-        });
+    // 6. Update rider status (already ON_TRIP from acceptance, but ensure it)
+    await Rider.findByIdAndUpdate(
+      riderId,
+      {
+        availabilityStatus: 'ON_TRIP',
+        currentBooking: booking._id
+      },
+      { session }
+    );
+
+    // 7. Create notification for user
+    const userNotification = new Notification({
+      userId: booking.userId,
+      bookingId: booking._id,
+      type: 'RIDE_STARTED',
+      title: 'Ride Started! 🚗',
+      message: 'Your ride has started. Enjoy your journey!',
+      data: {
+        bookingId: booking._id,
+        startTime: booking.rideStartTime
       }
-    } catch (ioError) {
-      console.log("Socket.io notification failed:", ioError.message);
+    });
+    await userNotification.save({ session });
+
+    await session.commitTransaction();
+
+    // 8. Emit socket event
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`user-${booking.userId}`).emit('ride-started', {
+        bookingId: booking._id,
+        startTime: booking.rideStartTime
+      });
     }
 
-    res.status(200).json({
+    res.json({
       success: true,
-      message: "Ride started successfully",
-      data: booking,
+      message: 'Ride started successfully',
+      data: {
+        booking,
+        rideStartTime: booking.rideStartTime
+      }
     });
+
   } catch (error) {
-    console.error("Start ride error:", error);
-    console.error("Error stack:", error.stack);
+    await session.abortTransaction();
+    console.error('Start ride error:', error);
     res.status(500).json({
       success: false,
-      message: "Failed to start ride: " + error.message,
+      message: 'Failed to start ride',
+      error: error.message
     });
+  } finally {
+    session.endSession();
   }
 };
 
@@ -638,189 +1084,382 @@ export const debugBookingStatus = async (req, res) => {
 };
 
 // Complete ride
+// controllers/riderController.js - Updated completeRide with proper payment handling
+
+/**
+ * Complete the ride and handle payment based on method
+ * - Cash: Mark as pending settlement (due in 3 days)
+ * - Online/Razorpay: Process admin commission and mark for payout (due in 7 days)
+ */
+// controllers/riderController.js - Fixed completeRide function
+
 export const completeRide = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { bookingId } = req.params;
-    const riderId = req.user._id;
     const { finalDistance, additionalCharges = 0 } = req.body;
+    const riderId = req.user._id;
 
+    console.log('========== COMPLETE RIDE ==========');
+    console.log(`Rider ${riderId} completing ride ${bookingId}`);
+    console.log('Request data:', { finalDistance, additionalCharges });
+
+    // 1. Find the booking
     const booking = await Booking.findOne({
       _id: bookingId,
       riderId,
-      bookingStatus: "TRIP_STARTED",
-    });
+      bookingStatus: 'TRIP_STARTED'
+    }).session(session);
 
     if (!booking) {
+      await session.abortTransaction();
       return res.status(404).json({
         success: false,
-        message: "Booking not found or not ongoing",
+        message: 'Booking not found or not in TRIP_STARTED status'
       });
     }
 
-    // Calculate final fare
-    const pricing = (await Pricing.findOne({ cabType: booking.cabType })) || {
-      pricePerKm: 10,
-      adminCommissionPercent: 20,
-    };
-    let finalFare = booking.estimatedFare || 100;
+    console.log('Booking found:', {
+      id: booking._id,
+      vehicleType: booking.vehicleType,
+      estimatedFare: booking.estimatedFare,
+      paymentMethod: booking.paymentMethod
+    });
 
-    if (finalDistance && finalDistance > (booking.distanceKm || 0)) {
-      const additionalDistance = finalDistance - (booking.distanceKm || 0);
-      const additionalFare = additionalDistance * (pricing.pricePerKm || 10);
-      finalFare += additionalFare;
+    // 2. Get pricing for fare calculation
+    const pricing = await Pricing.findOne({ 
+      cabType: booking.vehicleType,
+      isActive: true 
+    }).session(session);
+
+    if (!pricing) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'Pricing configuration not found'
+      });
     }
 
-    finalFare += additionalCharges;
+    console.log('Pricing found:', {
+      baseFare: pricing.baseFare,
+      pricePerKm: pricing.pricePerKm,
+      adminCommissionPercent: pricing.adminCommissionPercent
+    });
+
+    // 3. Calculate final fare
+    let finalFare = booking.estimatedFare;
+    let adminCommission = 0;
+    let riderEarning = 0;
+    let distanceUsed = booking.distanceKm;
+
+    if (finalDistance && finalDistance > 0) {
+      // Use actual distance for fare calculation
+      const baseFare = pricing.baseFare;
+      const pricePerKm = pricing.pricePerKm;
+      
+      // Calculate fare based on actual distance
+      finalFare = baseFare + (finalDistance * pricePerKm) + additionalCharges;
+      distanceUsed = finalDistance;
+      
+      console.log('Fare calculation with actual distance:', {
+        baseFare,
+        pricePerKm,
+        finalDistance,
+        additionalCharges,
+        calculatedFare: finalFare
+      });
+    } else {
+      // Use estimated fare with charges
+      finalFare = booking.estimatedFare + additionalCharges;
+      console.log('Fare calculation with estimated distance:', {
+        estimatedFare: booking.estimatedFare,
+        additionalCharges,
+        calculatedFare: finalFare
+      });
+    }
 
     // Calculate commission and earnings
     const adminCommissionPercent = pricing.adminCommissionPercent || 20;
-    const adminCommissionAmount = (finalFare * adminCommissionPercent) / 100;
-    const riderEarning = finalFare - adminCommissionAmount;
+    adminCommission = (finalFare * adminCommissionPercent) / 100;
+    riderEarning = finalFare - adminCommission;
 
-    // Update booking
-    booking.bookingStatus = "TRIP_COMPLETED";
-    booking.rideEndTime = new Date();
-    booking.finalFare = finalFare;
-    booking.adminCommissionAmount = adminCommissionAmount;
-    booking.riderEarning = riderEarning;
-    await booking.save();
-
-    // Update rider status and completed rides
-    await Rider.findByIdAndUpdate(riderId, {
-      availabilityStatus: "AVAILABLE",
-      currentBooking: null,
-      isLocked: false,
-      lockedUntil: null,
-      $inc: { completedRides: 1 },
+    console.log('Earnings calculation:', {
+      finalFare,
+      adminCommissionPercent,
+      adminCommission,
+      riderEarning
     });
 
-    const cab = await Cab.findOne({ riderId });
-    if (cab) {
-      cab.isAvailable = true;
-      await cab.save();
+    // 4. Update booking with final details
+    booking.bookingStatus = 'TRIP_COMPLETED';
+    booking.rideEndTime = new Date();
+    booking.finalFare = Math.round(finalFare);
+    booking.adminCommissionAmount = Math.round(adminCommission);
+    booking.riderEarning = Math.round(riderEarning);
+    
+    if (finalDistance && finalDistance > 0) {
+      booking.distanceKm = finalDistance;
+    }
+    
+    await booking.save({ session });
+    console.log('Booking updated with final details');
+
+    // 5. Update rider status and stats
+    const rider = await Rider.findByIdAndUpdate(
+      riderId,
+      {
+        availabilityStatus: 'AVAILABLE',
+        currentBooking: null,
+        isLocked: false,
+        lockedUntil: null,
+        $inc: { completedRides: 1 }
+      },
+      { session, new: true }
+    );
+    console.log('Rider status updated');
+
+    // 6. Update cab availability
+    await Cab.findOneAndUpdate(
+      { riderId },
+      { isAvailable: true },
+      { session }
+    );
+    console.log('Cab availability updated');
+
+    // 7. Create rider earning record with settlement details based on payment method
+    const now = new Date();
+    let settlementDueDate = null;
+    let payoutStatus = 'PENDING';
+
+    // Set settlement rules based on payment method
+    if (booking.paymentMethod === 'CASH') {
+      // Cash payments: Rider owes money to company, due in 3 days
+      settlementDueDate = new Date(now);
+      settlementDueDate.setDate(settlementDueDate.getDate() + 3);
+      payoutStatus = 'PENDING_SETTLEMENT';
+      console.log('Cash payment - settlement due in 3 days:', settlementDueDate);
+    } else if (booking.paymentMethod === 'RAZORPAY' || booking.paymentMethod === 'ONLINE') {
+      // Online payments: Company owes money to rider, payout in 7 days
+      settlementDueDate = new Date(now);
+      settlementDueDate.setDate(settlementDueDate.getDate() + 7);
+      payoutStatus = 'PENDING_PAYOUT';
+      console.log('Online payment - payout due in 7 days:', settlementDueDate);
+    } else {
+      // Other payment methods
+      settlementDueDate = new Date(now);
+      settlementDueDate.setDate(settlementDueDate.getDate() + 7);
+      payoutStatus = 'PENDING';
     }
 
-    // Update rider activity
-    await RiderActivity.findOneAndUpdate(
-      { riderId },
-      { availabilityStatus: "AVAILABLE" },
-    );
-
-    // Create rider earning record
-    const riderEarningRecord = await RiderEarning.create({
+    const riderEarningRecord = new RiderEarning({
       bookingId: booking._id,
       riderId,
-      totalFare: finalFare,
-      adminCommission: adminCommissionAmount,
-      riderEarning: riderEarning,
-      payoutStatus: "PENDING",
+      totalFare: booking.finalFare,
+      adminCommission: booking.adminCommissionAmount,
+      riderEarning: booking.riderEarning,
+      payoutStatus: payoutStatus,
+      settlementDueDate: settlementDueDate,
+      paymentMethod: booking.paymentMethod,
+      completedAt: new Date()
     });
+    await riderEarningRecord.save({ session });
+    console.log('Rider earning record created with status:', payoutStatus);
 
-    // Update rider wallet
-    await RiderWallet.findOneAndUpdate(
+    // 8. Update rider wallet
+    if (booking.paymentMethod === 'RAZORPAY' || booking.paymentMethod === 'ONLINE') {
+      await RiderWallet.findOneAndUpdate(
+        { riderId },
+        {
+          $inc: { 
+            pendingBalance: booking.riderEarning,
+            totalEarned: booking.riderEarning
+          },
+          $push: {
+            transactions: {
+              type: 'CREDIT',
+              amount: booking.riderEarning,
+              description: `Earnings from ride ${booking._id} (payout due in 7 days)`,
+              referenceId: booking._id,
+              referenceModel: 'Booking',
+              status: 'PENDING',
+              settlementDueDate: settlementDueDate
+            }
+          },
+          updatedAt: new Date()
+        },
+        { session, upsert: true }
+      );
+      console.log('Rider wallet updated with pending balance');
+    } else if (booking.paymentMethod === 'CASH') {
+      await RiderWallet.findOneAndUpdate(
+        { riderId },
+        {
+          $inc: { 
+            cashCollected: booking.finalFare,
+            totalEarned: booking.riderEarning
+          },
+          $push: {
+            transactions: {
+              type: 'CASH_COLLECTED',
+              amount: booking.finalFare,
+              description: `Cash collected from ride ${booking._id} (due in 3 days)`,
+              referenceId: booking._id,
+              referenceModel: 'Booking',
+              status: 'PENDING_SETTLEMENT',
+              settlementDueDate: settlementDueDate
+            }
+          },
+          updatedAt: new Date()
+        },
+        { session, upsert: true }
+      );
+      console.log('Rider wallet updated with cash collection record');
+    }
+
+    // 9. Update rider activity
+    await RiderActivity.findOneAndUpdate(
       { riderId },
       {
-        $inc: { balance: riderEarning },
-        updatedAt: new Date(),
+        availabilityStatus: 'AVAILABLE',
+        isOnline: true,
+        lastSeenAt: new Date()
       },
-      { upsert: true },
+      { session, upsert: true }
     );
 
-    // Notify user
-    const io = req.app.get("io");
-    io.to(booking.userId.toString()).emit("ride-completed", {
+    // 10. Get payment details
+    const Payment = mongoose.model('Payment');
+    const payment = await Payment.findOne({ bookingId: booking._id }).session(session);
+    
+    if (payment) {
+      // Update payment record based on payment method - using valid enum values
+      if (booking.paymentMethod === 'CASH') {
+        payment.paymentStatus = 'PENDING_SETTLEMENT'; // Now this is valid
+        payment.settlementDueDate = settlementDueDate;
+        payment.collectedBy = 'RIDER';
+        payment.collectedById = riderId;
+        payment.collectedByModel = 'Rider';
+        payment.metadata = {
+          ...payment.metadata,
+          cashCollected: booking.finalFare,
+          adminCommission: booking.adminCommissionAmount
+        };
+      } else if (booking.paymentMethod === 'RAZORPAY' || booking.paymentMethod === 'ONLINE') {
+        payment.paymentStatus = 'SUCCESS';
+        payment.metadata = {
+          ...payment.metadata,
+          payoutDueDate: settlementDueDate,
+          adminCommission: booking.adminCommissionAmount,
+          riderEarning: booking.riderEarning
+        };
+      }
+      payment.updatedAt = new Date();
+      await payment.save({ session });
+      console.log('Payment record updated with status:', payment.paymentStatus);
+    } else {
+      console.log('No payment record found for booking:', booking._id);
+    }
+
+    // 11. Create notifications
+    const userNotification = new Notification({
+      userId: booking.userId,
       bookingId: booking._id,
-      finalFare,
-      paymentType: booking.paymentType,
+      type: 'RIDE_COMPLETED',
+      title: 'Ride Completed! 🎉',
+      message: `Your ride has been completed. Final fare: ₹${booking.finalFare}`,
+      data: {
+        bookingId: booking._id,
+        finalFare: booking.finalFare,
+        distance: booking.distanceKm,
+        duration: Math.round(
+          (booking.rideEndTime - booking.rideStartTime) / (1000 * 60)
+        ),
+        paymentMethod: booking.paymentMethod
+      }
     });
 
-    // Create notifications
-    await Notification.create([
-      {
-        userId: booking.userId,
-        bookingId: booking._id,
-        type: "TRIP_COMPLETED",
-        title: "Ride Completed",
-        message: `Your ride has been completed. Fare: ₹${finalFare}`,
-        data: {
-          finalFare,
-          distance: booking.distanceKm,
-          duration: Math.round(
-            (booking.rideEndTime - booking.rideStartTime) / (1000 * 60),
-          ),
-        },
-      },
-      {
-        riderId,
-        bookingId: booking._id,
-        type: "TRIP_COMPLETED",
-        title: "Ride Completed",
-        message: `You earned ₹${riderEarning} from this ride`,
-        data: {
-          riderEarning,
-          totalFare: finalFare,
-          commission: adminCommissionAmount,
-        },
-      },
-    ]);
+    let riderNotificationMessage = '';
+    if (booking.paymentMethod === 'CASH') {
+      riderNotificationMessage = `You collected ₹${booking.finalFare} in cash. Please remit ₹${booking.adminCommissionAmount} to company within 3 days. Your earning: ₹${booking.riderEarning}`;
+    } else {
+      riderNotificationMessage = `You earned ₹${booking.riderEarning} from this ride. Amount will be credited to your account within 7 days.`;
+    }
 
-    res.status(200).json({
+    const riderNotification = new Notification({
+      riderId,
+      bookingId: booking._id,
+      type: 'RIDE_COMPLETED',
+      title: 'Ride Completed! 🎉',
+      message: riderNotificationMessage,
+      data: {
+        bookingId: booking._id,
+        riderEarning: booking.riderEarning,
+        totalFare: booking.finalFare,
+        adminCommission: booking.adminCommissionAmount,
+        paymentMethod: booking.paymentMethod,
+        settlementDueDate: settlementDueDate
+      }
+    });
+
+    await userNotification.save({ session });
+    await riderNotification.save({ session });
+    console.log('Notifications created');
+
+    await session.commitTransaction();
+    console.log('Transaction committed successfully');
+
+    // 12. Emit socket events
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`user-${booking.userId}`).emit('ride-completed', {
+        bookingId: booking._id,
+        finalFare: booking.finalFare,
+        riderEarning: booking.riderEarning,
+        paymentMethod: booking.paymentMethod
+      });
+    }
+
+    // 13. Return success response with payment details
+    res.json({
       success: true,
-      message: "Ride completed successfully",
+      message: 'Ride completed successfully',
       data: {
         booking,
-        riderEarning: riderEarningRecord,
-      },
+        earnings: {
+          finalFare: booking.finalFare,
+          adminCommission: booking.adminCommissionAmount,
+          riderEarning: booking.riderEarning,
+          paymentMethod: booking.paymentMethod,
+          settlementDueDate: settlementDueDate,
+          payoutStatus: payoutStatus
+        },
+        payment: {
+          method: booking.paymentMethod,
+          message: booking.paymentMethod === 'CASH' 
+            ? `Please remit ₹${booking.adminCommissionAmount} to company within 3 days`
+            : `₹${booking.riderEarning} will be credited to your account within 7 days`
+        }
+      }
     });
+
   } catch (error) {
-    console.error("Complete ride error:", error);
+    await session.abortTransaction();
+    console.error('========== ERROR IN COMPLETE RIDE ==========');
+    console.error('Error name:', error.name);
+    console.error('Error message:', error.message);
+    console.error('Error stack:', error.stack);
+    
     res.status(500).json({
       success: false,
-      message: "Failed to complete ride",
+      message: 'Failed to complete ride',
+      error: error.message
     });
+  } finally {
+    session.endSession();
   }
 };
-
-// TEMPORARY ROUTE – DELETE AFTER USE
-// export const resetAllRidersAndCabs = async (req, res) => {
-//   try {
-//     // 1. Reset all riders
-//     await Rider.updateMany(
-//       {},
-//       {
-//         $set: {
-//           currentBooking: null,
-//           availabilityStatus: "AVAILABLE",
-//           isLocked: false,
-//           lockedUntil: null,
-//         },
-//       },
-//     );
-
-//     // 2. Reset all cabs
-//     await Cab.updateMany(
-//       {},
-//       {
-//         $set: {
-//           isAvailable: true,
-//           isOnRide: false, // if your model has this
-//           currentBooking: null, // if your model has this
-//         },
-//       },
-//     );
-
-//     // 3. (Optional) Clear all BookingRequests
-//     await BookingRequest.deleteMany({});
-
-//     res.status(200).json({
-//       success: true,
-//       message: "✅ All riders and cabs have been reset",
-//     });
-//   } catch (error) {
-//     console.error("Reset error:", error);
-//     res.status(500).json({ success: false, message: error.message });
-//   }
-// };
 
 // Update rider rating (called when user rates rider)
 export const updateRiderRating = async (riderId) => {
@@ -848,166 +1487,286 @@ export const updateRiderRating = async (riderId) => {
 
 // Start return ride (for round trips)
 export const startReturnRide = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { bookingId } = req.params;
-    const riderId = req.user._id;
     const { otp } = req.body;
+    const riderId = req.user._id;
 
+    console.log(`Rider ${riderId} starting return ride ${bookingId}`);
+
+    // 1. Find the round trip booking
     const booking = await Booking.findOne({
       _id: bookingId,
       riderId,
-      tripType: "ROUND_TRIP",
-      bookingStatus: "TRIP_COMPLETED", // First ride completed
-      returnRideStatus: "SCHEDULED",
-    });
+      bookingType: 'ROUND_TRIP',
+      bookingStatus: 'TRIP_COMPLETED' // First leg completed
+    }).session(session);
 
     if (!booking) {
+      await session.abortTransaction();
       return res.status(404).json({
         success: false,
-        message: "Return ride not available",
+        message: 'Return ride not available or first leg not completed'
       });
     }
 
-    // Verify OTP for return ride
+    // 2. Verify return OTP
     if (!otp || booking.returnRideOtp !== otp) {
+      await session.abortTransaction();
       return res.status(400).json({
         success: false,
-        message: "Invalid OTP",
+        message: 'Invalid OTP for return ride'
       });
     }
 
-    // Start return ride
-    booking.returnRideStatus = "TRIP_STARTED";
+    // 3. Update booking for return ride
+    booking.returnRideStatus = 'TRIP_STARTED';
     booking.returnRideStartTime = new Date();
     booking.returnRideOtpVerifiedAt = new Date();
-    await booking.save();
+    booking.bookingStatus = 'RETURN_RIDE_STARTED';
+    await booking.save({ session });
 
-    // Update rider status
-    await Rider.findByIdAndUpdate(riderId, {
-      availabilityStatus: "ON_TRIP",
-    });
+    // 4. Update rider status
+    await Rider.findByIdAndUpdate(
+      riderId,
+      {
+        availabilityStatus: 'ON_TRIP',
+        currentBooking: booking._id
+      },
+      { session }
+    );
 
-    // Notify user
-    const io = req.app.get("io");
-    io.to(booking.userId.toString()).emit("return-ride-started", {
+    // 5. Create notification
+    const notification = new Notification({
+      userId: booking.userId,
       bookingId: booking._id,
-      startTime: booking.returnRideStartTime,
+      type: 'RETURN_RIDE_STARTED',
+      title: 'Return Ride Started! 🔄',
+      message: 'Your return journey has begun. Safe travels!',
+      data: {
+        bookingId: booking._id,
+        startTime: booking.returnRideStartTime
+      }
+    });
+    await notification.save({ session });
+
+    await session.commitTransaction();
+
+    // 6. Emit socket event
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`user-${booking.userId}`).emit('return-ride-started', {
+        bookingId: booking._id,
+        startTime: booking.returnRideStartTime
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Return ride started successfully',
+      data: {
+        booking,
+        returnRideStartTime: booking.returnRideStartTime
+      }
     });
 
-    res.status(200).json({
-      success: true,
-      message: "Return ride started successfully",
-      data: booking,
-    });
   } catch (error) {
-    console.error("Start return ride error:", error);
+    await session.abortTransaction();
+    console.error('Start return ride error:', error);
     res.status(500).json({
       success: false,
-      message: "Failed to start return ride",
+      message: 'Failed to start return ride',
+      error: error.message
     });
+  } finally {
+    session.endSession();
   }
 };
 
+
 // Complete return ride
 export const completeReturnRide = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { bookingId } = req.params;
+    const { returnDistance, additionalCharges = 0 } = req.body;
     const riderId = req.user._id;
-    const { finalDistance, additionalCharges = 0 } = req.body;
 
+    console.log(`Rider ${riderId} completing return ride ${bookingId}`);
+
+    // 1. Find the round trip booking
     const booking = await Booking.findOne({
       _id: bookingId,
       riderId,
-      tripType: "ROUND_TRIP",
-      returnRideStatus: "TRIP_STARTED",
-    });
+      bookingType: 'ROUND_TRIP',
+      returnRideStatus: 'TRIP_STARTED'
+    }).session(session);
 
     if (!booking) {
+      await session.abortTransaction();
       return res.status(404).json({
         success: false,
-        message: "Return ride not found or not ongoing",
+        message: 'Return ride not found or not started'
       });
     }
 
-    // Calculate return ride fare
-    const pricing = await Pricing.findOne({ cabType: booking.cabType });
-    let returnRideFinalFare = booking.roundTripDetails.returnEstimatedFare;
+    // 2. Get pricing for fare calculation
+    const pricing = await Pricing.findOne({ 
+      cabType: booking.vehicleType,
+      isActive: true 
+    }).session(session);
 
-    if (
-      finalDistance &&
-      finalDistance > booking.roundTripDetails.returnDistance
-    ) {
-      const additionalDistance =
-        finalDistance - booking.roundTripDetails.returnDistance;
-      const additionalFare = additionalDistance * pricing.pricePerKm;
-      returnRideFinalFare += additionalFare;
+    if (!pricing) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'Pricing configuration not found'
+      });
     }
 
-    returnRideFinalFare += additionalCharges;
-
-    // Calculate total fare for both rides
-    const totalFinalFare = booking.finalFare + returnRideFinalFare;
-
-    // Calculate commission and earnings for return ride
+    // 3. Calculate return ride fare
+    const baseFare = pricing.baseFare;
+    const pricePerKm = pricing.pricePerKm;
     const adminCommissionPercent = pricing.adminCommissionPercent || 20;
-    const adminCommissionAmount =
-      (returnRideFinalFare * adminCommissionPercent) / 100;
-    const riderEarning = returnRideFinalFare - adminCommissionAmount;
 
-    // Update booking
-    booking.returnRideStatus = "TRIP_COMPLETED";
+    // Use provided distance or estimated
+    const actualReturnDistance = returnDistance || booking.roundTripDetails?.returnDistance || booking.distanceKm;
+    
+    // Calculate return fare
+    const returnFare = baseFare + (actualReturnDistance * pricePerKm) + additionalCharges;
+    const returnCommission = (returnFare * adminCommissionPercent) / 100;
+    const returnEarning = returnFare - returnCommission;
+
+    // 4. Update total fare (add to existing fare)
+    const totalFinalFare = (booking.finalFare || booking.estimatedFare) + returnFare;
+    const totalCommission = (booking.adminCommissionAmount || 0) + returnCommission;
+    const totalEarning = (booking.riderEarning || 0) + returnEarning;
+
+    // 5. Update booking
+    booking.returnRideStatus = 'TRIP_COMPLETED';
     booking.returnRideEndTime = new Date();
-    booking.returnRideFinalFare = returnRideFinalFare;
-    booking.roundTripDetails.isReturnRideCompleted = true;
-    booking.finalFare = totalFinalFare;
-    booking.adminCommissionAmount += adminCommissionAmount;
-    booking.riderEarning += riderEarning;
-    await booking.save();
+    booking.returnRideFinalFare = Math.round(returnFare);
+    booking.finalFare = Math.round(totalFinalFare);
+    booking.adminCommissionAmount = Math.round(totalCommission);
+    booking.riderEarning = Math.round(totalEarning);
+    booking.bookingStatus = 'TRIP_COMPLETED';
+    
+    if (booking.roundTripDetails) {
+      booking.roundTripDetails.isReturnRideCompleted = true;
+      booking.roundTripDetails.returnActualDistance = actualReturnDistance;
+    }
+    
+    await booking.save({ session });
 
-    // Update rider status
-    await Rider.findByIdAndUpdate(riderId, {
-      availabilityStatus: "AVAILABLE",
-      $inc: { completedRides: 1 },
-    });
+    // 6. Update rider stats
+    await Rider.findByIdAndUpdate(
+      riderId,
+      {
+        availabilityStatus: 'AVAILABLE',
+        currentBooking: null,
+        isLocked: false,
+        lockedUntil: null,
+        $inc: { completedRides: 1 }
+      },
+      { session }
+    );
 
-    // Create rider earning record for return ride
-    await RiderEarning.create({
+    // 7. Update cab availability
+    await Cab.findOneAndUpdate(
+      { riderId },
+      { isAvailable: true },
+      { session }
+    );
+
+    // 8. Create rider earning record for return leg
+    const returnEarningRecord = new RiderEarning({
       bookingId: booking._id,
       riderId,
-      totalFare: returnRideFinalFare,
-      adminCommission: adminCommissionAmount,
-      riderEarning: riderEarning,
-      payoutStatus: "PENDING",
+      totalFare: returnFare,
+      adminCommission: returnCommission,
+      riderEarning: returnEarning,
+      payoutStatus: 'PENDING',
+      completedAt: new Date(),
+      tripLeg: 'RETURN'
     });
+    await returnEarningRecord.save({ session });
 
-    // Update rider wallet
+    // 9. Update rider wallet with additional earnings
     await RiderWallet.findOneAndUpdate(
       { riderId },
       {
-        $inc: { balance: riderEarning },
-        updatedAt: new Date(),
+        $inc: { balance: returnEarning },
+        $push: {
+          transactions: {
+            type: 'CREDIT',
+            amount: returnEarning,
+            description: `Return ride earnings ${booking._id}`,
+            referenceId: booking._id,
+            referenceModel: 'Booking'
+          }
+        },
+        updatedAt: new Date()
       },
+      { session, upsert: true }
     );
 
-    // Notify user
-    const io = req.app.get("io");
-    io.to(booking.userId.toString()).emit("return-ride-completed", {
+    // 10. Create notification for user
+    const notification = new Notification({
+      userId: booking.userId,
       bookingId: booking._id,
-      returnRideFinalFare,
-      totalFinalFare: totalFinalFare,
+      type: 'RETURN_RIDE_COMPLETED',
+      title: 'Round Trip Completed! 🎉',
+      message: `Your round trip is complete. Total fare: ₹${totalFinalFare}`,
+      data: {
+        bookingId: booking._id,
+        totalFare: totalFinalFare,
+        returnFare,
+        mainFare: booking.finalFare - returnFare
+      }
+    });
+    await notification.save({ session });
+
+    await session.commitTransaction();
+
+    // 11. Emit socket event
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`user-${booking.userId}`).emit('return-ride-completed', {
+        bookingId: booking._id,
+        totalFare: totalFinalFare,
+        returnFare
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Return ride completed successfully',
+      data: {
+        booking,
+        earnings: {
+          mainRideEarning: booking.riderEarning - returnEarning,
+          returnRideEarning: returnEarning,
+          totalEarning: booking.riderEarning,
+          walletBalance: (await RiderWallet.findOne({ riderId }))?.balance || 0
+        }
+      }
     });
 
-    res.status(200).json({
-      success: true,
-      message: "Return ride completed successfully",
-      data: booking,
-    });
   } catch (error) {
-    console.error("Complete return ride error:", error);
+    await session.abortTransaction();
+    console.error('Complete return ride error:', error);
     res.status(500).json({
       success: false,
-      message: "Failed to complete return ride",
+      message: 'Failed to complete return ride',
+      error: error.message
     });
+  } finally {
+    session.endSession();
   }
 };
 
@@ -1699,6 +2458,36 @@ export const getRiderNotifications = async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to get notifications",
+    });
+  }
+};
+
+
+// Add this function to riderController.js
+
+// @desc    Get active booking for rider
+// @route   GET /api/riders/active-booking
+// @access  Private (Rider)
+export const getActiveBooking = async (req, res) => {
+  try {
+    const riderId = req.user._id;
+    
+    const activeBooking = await Booking.findOne({
+      riderId,
+      bookingStatus: { 
+        $in: ['DRIVER_ASSIGNED', 'DRIVER_ARRIVED', 'TRIP_STARTED'] 
+      }
+    }).populate('userId', 'name phone email');
+
+    res.json({
+      success: true,
+      data: activeBooking || null
+    });
+  } catch (error) {
+    console.error('Get active booking error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching active booking'
     });
   }
 };
