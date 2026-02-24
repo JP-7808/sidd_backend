@@ -269,6 +269,9 @@ export const registerRider = async (req, res) => {
       yearOfManufacture,
       acAvailable = true
     } = req.body;
+
+    // Convert cabType to uppercase
+    const cabTypeUpper = cabType ? cabType.toUpperCase() : null;
     // Check if rider exists
     const existingRider = await Rider.findOne({ email });
     if (existingRider) {
@@ -338,11 +341,12 @@ export const registerRider = async (req, res) => {
         profilePhotoUrl = result.secure_url;
       } catch (uploadError) {
         console.error('Profile photo upload error:', uploadError);
-        return res.status(400).json({
-          success: false,
-          message: 'Failed to upload profile photo'
-        });
       }
+    }
+    
+    // Fallback to default avatar if no photo uploaded
+    if (!profilePhotoUrl) {
+      profilePhotoUrl = 'https://ui-avatars.com/api/?name=' + encodeURIComponent(name) + '&background=219ebc&color=fff';
     }
     // Create rider
     const rider = await Rider.create({
@@ -445,7 +449,7 @@ export const registerRider = async (req, res) => {
     // Create cab with images and documents
     const cabData = {
       riderId: rider._id,
-      cabType,
+      cabType: cabTypeUpper,
       cabNumber: cabNumber.toUpperCase(),
       cabModel,
       seatingCapacity: parseInt(seatingCapacity),

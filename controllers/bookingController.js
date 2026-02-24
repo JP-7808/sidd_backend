@@ -24,7 +24,11 @@ export const calculateFareController = async (req, res) => {
   try {
     console.log('Received fare calculation request:', req.body);
     
-    const { pickup, drop, vehicleType, tripType } = req.body;
+    const { pickup, drop, vehicleType, tripType, days = 1, hours = 0 } = req.body;
+
+    // Validate days for round trip and outstation
+    const tripDays = ['ROUND_TRIP', 'OUTSTATION'].includes(tripType) ? Math.max(1, days) : 1;
+    const tripHours = tripType === 'LOCAL_RENTAL' ? Math.max(1, hours) : 0;
 
     // Validate required fields
     if (!pickup || !drop) {
@@ -96,9 +100,8 @@ export const calculateFareController = async (req, res) => {
     const distanceKm = calculateDistance(pickupLat, pickupLng, dropLat, dropLng);
 
     // Get pricing from database
-    const Pricing = (await import('../models/Pricing.js')).default;
     
-    let pricing = await Pricing.findOne({ 
+    let pricing = await Pricing.findOne({
       cabType: vehicleType,
       isActive: true 
     });
@@ -106,20 +109,114 @@ export const calculateFareController = async (req, res) => {
     // If no pricing found, use default values
     if (!pricing) {
       console.log('No pricing found for vehicle type:', vehicleType, 'using defaults');
-      
+      pricing = {
+        baseFare: 500,
+        pricePerKm: 12,
+        driverAllowancePerDay: 200
+      };
     }
 
-    // Calculate fare
+    // Pricing values
     const baseFare = pricing.baseFare;
     const pricePerKm = pricing.pricePerKm;
+    const driverAllowancePerNight = pricing.driverAllowancePerDay || 200;
+    const minKmPerDay = 250;
     
-    // Apply trip type multiplier
-    let multiplier = 1;
-    if (tripType === 'ROUND_TRIP') {
-      multiplier = 1.8; // 20% discount on return trip
+    // Local rental pricing
+    const hourlyRate = pricing.hourlyRate || (baseFare / 4); // Default hourly rate
+    const minHoursLocal = pricing.minHoursLocal || 2;
+    const driverChargesPerDay = pricing.driverChargesPerDay || 200;
+
+    let estimatedFare = 0;
+    let billableKm = null;
+    let totalNights = null;
+    let billableHours = null;
+    let fareBreakdown = {
+      baseFare: baseFare,
+      distanceFare: 0,
+      driverCharges: 0,
+      total: 0
+    };
+
+    if (tripType === 'ONE_WAY') {
+      // ONE WAY - Simple fare calculation
+      estimatedFare = baseFare + (distanceKm * pricePerKm);
+      fareBreakdown = {
+        baseFare: baseFare,
+        distanceFare: distanceKm * pricePerKm,
+        driverCharges: 0,
+        total: estimatedFare
+      };
+
+    } else if (tripType === 'ROUND_TRIP') {
+      // Round Trip Calculation
+      // Total distance (up + down)
+      const totalDistance = distanceKm * 2;
+      
+      // Minimum billable km: 250 km per day
+      const minimumBillableKm = minKmPerDay * tripDays;
+      
+      // Billable km is the higher of actual or minimum
+      billableKm = Math.max(totalDistance, minimumBillableKm);
+      billableKm = Math.round(billableKm * 10) / 10;
+      
+      // Total nights = tripDays
+      totalNights = tripDays;
+      
+      // Final fare
+      estimatedFare = baseFare + (billableKm * pricePerKm) + (driverAllowancePerNight * totalNights);
+      fareBreakdown = {
+        baseFare: baseFare,
+        distanceFare: billableKm * pricePerKm,
+        driverCharges: driverAllowancePerNight * totalNights,
+        total: estimatedFare
+      };
+
+    } else if (tripType === 'OUTSTATION') {
+      // Outstation - Similar to round trip but per day rate
+      const totalDistance = distanceKm * 2; // Round trip distance
+      const minimumBillableKm = minKmPerDay * tripDays;
+      billableKm = Math.max(totalDistance, minimumBillableKm);
+      billableKm = Math.round(billableKm * 10) / 10;
+      totalNights = tripDays;
+      
+      // Outstation fare: base + distance + driver allowance
+      estimatedFare = baseFare + (billableKm * pricePerKm) + (driverAllowancePerNight * totalNights);
+      fareBreakdown = {
+        baseFare: baseFare,
+        distanceFare: billableKm * pricePerKm,
+        driverCharges: driverAllowancePerNight * totalNights,
+        total: estimatedFare
+      };
+
+    } else if (tripType === 'LOCAL_RENTAL') {
+      // Local Rental - Hourly/Daily rate
+      const rentalHours = tripHours || minHoursLocal;
+      billableHours = rentalHours;
+      
+      // Local rental fare: base for first hour + hourly rate for additional hours + driver charges
+      const additionalHours = Math.max(0, rentalHours - 1); // First hour included in base
+      estimatedFare = baseFare + (additionalHours * hourlyRate) + driverChargesPerDay;
+      fareBreakdown = {
+        baseFare: baseFare,
+        distanceFare: additionalHours * hourlyRate,
+        driverCharges: driverChargesPerDay,
+        total: estimatedFare
+      };
+
+    } else {
+      // Default to ONE_WAY if unknown trip type
+      estimatedFare = baseFare + (distanceKm * pricePerKm);
+      fareBreakdown = {
+        baseFare: baseFare,
+        distanceFare: distanceKm * pricePerKm,
+        driverCharges: 0,
+        total: estimatedFare
+      };
     }
 
-    const estimatedFare = Math.round((baseFare + (distanceKm * pricePerKm)) * multiplier);
+    // Round off
+    estimatedFare = Math.round(estimatedFare);
 
     // Return response
     res.json({
@@ -131,7 +228,16 @@ export const calculateFareController = async (req, res) => {
         estimatedFare,
         vehicleType,
         currency: 'INR',
-        tripType: tripType || 'ONE_WAY'
+        tripType: tripType || 'ONE_WAY',
+        days: ['ROUND_TRIP', 'OUTSTATION'].includes(tripType) ? tripDays : null,
+        hours: tripType === 'LOCAL_RENTAL' ? billableHours : null,
+        billableKm: ['ROUND_TRIP', 'OUTSTATION'].includes(tripType) ? billableKm : null,
+        totalNights: ['ROUND_TRIP', 'OUTSTATION'].includes(tripType) ? totalNights : null,
+        driverAllowancePerNight: ['ROUND_TRIP', 'OUTSTATION'].includes(tripType) ? driverAllowancePerNight : null,
+        driverAllowanceTotal: ['ROUND_TRIP', 'OUTSTATION'].includes(tripType) ? (driverAllowancePerNight * (totalNights || 0)) : null,
+        hourlyRate: tripType === 'LOCAL_RENTAL' ? hourlyRate : null,
+        driverChargesPerDay: tripType === 'LOCAL_RENTAL' ? driverChargesPerDay : null,
+        fareBreakdown
       }
     });
 
@@ -184,7 +290,9 @@ export const createBooking = async (req, res) => {
       scheduledAt,
       paymentMethod,
       distanceKm,
-      estimatedFare
+      estimatedFare,
+      tripType,
+      days
     } = req.body;
 
     // Validate required fields
@@ -266,6 +374,8 @@ export const createBooking = async (req, res) => {
       pickup: pickupLocation,
       drop: dropLocation,
       vehicleType,
+      tripType: tripType || 'ONE_WAY',
+      days: days || 1,
       bookingType: bookingType || 'IMMEDIATE',
       scheduledAt: bookingType === 'SCHEDULED' ? new Date(scheduledAt) : null,
       distanceKm: distanceKm || 0,
@@ -1123,7 +1233,35 @@ export const driverArrived = async (req, res) => {
     }
 
     booking.bookingStatus = 'DRIVER_ARRIVED';
+    booking.driverArrivedAt = new Date(); // Track when driver arrived
     await booking.save();
+
+    // Auto-cancel after 5 minutes if OTP not verified
+    setTimeout(async () => {
+      try {
+        const currentBooking = await Booking.findById(id);
+        if (currentBooking && currentBooking.bookingStatus === 'DRIVER_ARRIVED') {
+          // Cancel the booking
+          currentBooking.bookingStatus = 'CANCELLED';
+          currentBooking.cancellationReason = 'OTP not verified within 5 minutes of driver arrival';
+          currentBooking.cancellationCharge = 0;
+          await currentBooking.save();
+
+          // Notify user
+          const io = req.app.get('io');
+          if (io) {
+            io.to(`user-${currentBooking.userId}`).emit('booking-cancelled', {
+              bookingId: currentBooking._id,
+              reason: 'OTP not verified within 5 minutes'
+            });
+          }
+          
+          console.log(`Booking ${id} auto-cancelled due to OTP not verified within 5 minutes`);
+        }
+      } catch (timeoutError) {
+        console.error('Auto-cancel timeout error:', timeoutError);
+      }
+    }, 5 * 60 * 1000); // 5 minutes
 
     // Notify user
     const notification = new Notification({
@@ -1685,4 +1823,107 @@ const sendBookingConfirmationEmail = async (booking, user) => {
     subject: `Booking Confirmed - ${booking._id}`,
     html
   });
+};
+
+// @desc    Rate a completed booking
+// @route   POST /api/bookings/:id/rate
+// @access  Private (User only)
+export const rateBooking = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rating, comment } = req.body;
+    const userId = req.user._id;
+
+    // Validate rating
+    if (!rating || rating < 1 || rating > 5) {
+      return res.status(400).json({
+        success: false,
+        message: 'Rating must be between 1 and 5'
+      });
+    }
+
+    // Find booking
+    const booking = await Booking.findById(id)
+      .populate('riderId', 'name phone overallRating totalRatings');
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found'
+      });
+    }
+
+    // Check if user owns this booking
+    if (booking.userId.toString() !== userId.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to rate this booking'
+      });
+    }
+
+    // Check if booking is completed
+    if (!['COMPLETED', 'TRIP_COMPLETED', 'PAYMENT_DONE'].includes(booking.bookingStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Can only rate completed trips'
+      });
+    }
+
+    // Check if already rated
+    if (booking.userRating) {
+      return res.status(400).json({
+        success: false,
+        message: 'You have already rated this trip'
+      });
+    }
+
+    // Update booking with rating
+    booking.userRating = rating;
+    booking.userReview = comment || '';
+    await booking.save();
+
+    // Update rider's overall rating
+    if (booking.riderId) {
+      const Rider = (await import('../models/Rider.js')).default;
+      const rider = await Rider.findById(booking.riderId._id);
+      
+      if (rider) {
+        // Calculate new average rating
+        const currentTotal = (rider.overallRating || 0) * (rider.totalRatings || 0);
+        const newTotalRatings = (rider.totalRatings || 0) + 1;
+        const newAverage = (currentTotal + rating) / newTotalRatings;
+        
+        rider.overallRating = Math.round(newAverage * 10) / 10;
+        rider.totalRatings = newTotalRatings;
+        
+        // Add to ratings array if exists
+        if (rider.ratings) {
+          rider.ratings.push({
+            userId: userId,
+            bookingId: booking._id,
+            rating: rating,
+            comment: comment || '',
+            createdAt: new Date()
+          });
+        }
+        
+        await rider.save();
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Rating submitted successfully',
+      data: {
+        rating: booking.userRating,
+        review: booking.userReview
+      }
+    });
+  } catch (error) {
+    console.error('Rate booking error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error while submitting rating'
+    });
+  }
 };

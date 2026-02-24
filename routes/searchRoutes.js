@@ -5,6 +5,245 @@ import { authenticateOptional } from '../middleware/authMiddleware.js';
 
 const router = express.Router();
 
+// Search places (autocomplete)
+router.get('/places', async (req, res) => {
+  try {
+    const { input, lat, lng } = req.query;
+    
+    if (!input) {
+      return res.status(400).json({
+        success: false,
+        message: 'Search input is required'
+      });
+    }
+
+    // Try to use Google Places Autocomplete API
+    try {
+      const axios = (await import('axios')).default;
+      const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+      
+      if (GOOGLE_MAPS_API_KEY) {
+        const params = {
+          input: input,
+          key: GOOGLE_MAPS_API_KEY,
+          types: 'address'
+        };
+        
+        // Add location bias if coordinates provided
+        if (lat && lng) {
+          params.location = `${lat},${lng}`;
+          params.radius = 50000; // 50km
+        }
+
+        const response = await axios.get('https://maps.googleapis.com/maps/api/place/autocomplete/json', {
+          params
+        });
+
+        if (response.data.status === 'OK' && response.data.predictions) {
+          const predictions = response.data.predictions.map(prediction => ({
+            place_id: prediction.place_id,
+            description: prediction.description,
+            structured_formatting: {
+              main_text: prediction.structured_formatting?.main_text || prediction.description,
+              secondary_text: prediction.structured_formatting?.secondary_text || ''
+            },
+            addressText: prediction.description
+          }));
+
+          return res.status(200).json({
+            success: true,
+            data: predictions
+          });
+        } else {
+          console.log('Google Places API status:', response.data.status);
+        }
+      }
+    } catch (googleError) {
+      console.log('Google Places Autocomplete API failed:', googleError.message);
+    }
+
+    // Fallback - return empty array instead of mock data to force proper handling
+    res.status(200).json({
+      success: true,
+      data: []
+    });
+  } catch (error) {
+    console.error('Search places error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to search places'
+    });
+  }
+});
+
+// Reverse geocode (get address from coordinates)
+router.get('/reverse-geocode', async (req, res) => {
+  try {
+    const { lat, lng } = req.query;
+    
+    if (!lat || !lng) {
+      return res.status(400).json({
+        success: false,
+        message: 'Latitude and longitude are required'
+      });
+    }
+
+    // Try to get actual address from Google Maps API
+    try {
+      const axios = (await import('axios')).default;
+      const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+      
+      if (GOOGLE_MAPS_API_KEY) {
+        const response = await axios.get('https://maps.googleapis.com/maps/api/geocode/json', {
+          params: {
+            latlng: `${lat},${lng}`,
+            key: GOOGLE_MAPS_API_KEY
+          }
+        });
+
+        if (response.data.status === 'OK' && response.data.results[0]) {
+          const result = response.data.results[0];
+          
+          // Extract address components
+          let city = '', state = '', country = '', postalCode = '';
+          result.address_components.forEach(component => {
+            if (component.types.includes('locality')) city = component.long_name;
+            else if (component.types.includes('administrative_area_level_2')) city = component.long_name;
+            else if (component.types.includes('administrative_area_level_1')) state = component.long_name;
+            else if (component.types.includes('country')) country = component.long_name;
+            else if (component.types.includes('postal_code')) postalCode = component.long_name;
+          });
+
+          return res.status(200).json({
+            success: true,
+            data: {
+              address: result.formatted_address,
+              addressText: result.formatted_address,
+              placeId: result.place_id,
+              city: city || 'Unknown',
+              state: state || 'Unknown',
+              country: country || 'Unknown',
+              postalCode: postalCode || '',
+              latitude: parseFloat(lat),
+              longitude: parseFloat(lng)
+            }
+          });
+        }
+      }
+    } catch (googleError) {
+      console.log('Google API failed, using mock data:', googleError.message);
+    }
+
+    // Fallback to mock address if Google API fails
+    const mockAddress = {
+      address: 'Current Location',
+      addressText: 'Current Location',
+      city: 'Lucknow',
+      state: 'Uttar Pradesh',
+      country: 'India',
+      postalCode: '226001',
+      latitude: parseFloat(lat),
+      longitude: parseFloat(lng)
+    };
+
+    res.status(200).json({
+      success: true,
+      data: mockAddress
+    });
+  } catch (error) {
+    console.error('Reverse geocode error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to reverse geocode'
+    });
+  }
+});
+
+// Get place details
+router.get('/place-details', async (req, res) => {
+  try {
+    const { placeId } = req.query;
+    
+    if (!placeId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Place ID is required'
+      });
+    }
+
+    // Try to get actual place details from Google Maps API
+    try {
+      const axios = (await import('axios')).default;
+      const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+      
+      if (GOOGLE_MAPS_API_KEY) {
+        const response = await axios.get('https://maps.googleapis.com/maps/api/place/details/json', {
+          params: {
+            place_id: placeId,
+            key: GOOGLE_MAPS_API_KEY,
+            fields: 'geometry,address_components,formatted_address'
+          }
+        });
+
+        if (response.data.status === 'OK' && response.data.result) {
+          const result = response.data.result;
+          const location = result.geometry?.location;
+          
+          if (!location) {
+            return res.status(400).json({
+              success: false,
+              message: 'Invalid place - no coordinates found'
+            });
+          }
+          
+          // Extract address components
+          let city = '', state = '', country = '', postalCode = '';
+          if (result.address_components) {
+            result.address_components.forEach(component => {
+              if (component.types.includes('locality')) city = component.long_name;
+              else if (component.types.includes('administrative_area_level_2')) city = component.long_name;
+              else if (component.types.includes('administrative_area_level_1')) state = component.long_name;
+              else if (component.types.includes('country')) country = component.long_name;
+              else if (component.types.includes('postal_code')) postalCode = component.long_name;
+            });
+          }
+
+          return res.status(200).json({
+            success: true,
+            data: {
+              place_id: result.place_id,
+              address: result.formatted_address,
+              addressText: result.formatted_address,
+              lat: location.lat,
+              lng: location.lng,
+              city: city || 'Unknown',
+              state: state || 'Unknown',
+              country: country || 'Unknown',
+              postalCode: postalCode || ''
+            }
+          });
+        } else {
+          console.log('Google Place Details API status:', response.data.status);
+        }
+      }
+    } catch (googleError) {
+      console.log('Google Place Details API failed:', googleError.message);
+    }
+
+    // If Google API fails, return error instead of mock data
+    return res.status(400).json({
+      success: false,
+      message: 'Could not get place details. Please try again or select location from map.'
+    });
+  } catch (error) {
+    console.error('Place details error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get place details'
+    });
+  }
+});
+
 // Get nearby cabs (frontend compatibility)
 router.get('/cabs/nearby', authenticateOptional, async (req, res) => {
   try {

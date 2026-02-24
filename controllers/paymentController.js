@@ -154,14 +154,34 @@ export const verifyPayment = async (req, res) => {
     };
     await payment.save({ session });
 
+    // Fetch the booking to determine what status to update to
+    const booking = await Booking.findById(bookingId).session(session);
+    
+    if (!booking) {
+      await session.abortTransaction();
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found'
+      });
+    }
+
+    // Update booking payment status based on current booking status
+    let newBookingStatus = booking.bookingStatus;
+    
+    if (booking.bookingStatus === 'TRIP_COMPLETED') {
+      // Payment after trip completion - mark as PAYMENT_DONE
+      newBookingStatus = 'PAYMENT_DONE';
+    } else if (booking.bookingStatus === 'INITIATED' || booking.bookingStatus === 'SEARCHING_DRIVER') {
+      // Prepaid booking before trip - keep as is or go to SEARCHING_DRIVER
+      newBookingStatus = 'SEARCHING_DRIVER';
+    }
+    
     // Update booking payment status
-    const booking = await Booking.findByIdAndUpdate(
+    await Booking.findByIdAndUpdate(
       bookingId,
       {
         paymentStatus: 'PAID',
-        bookingStatus: payment.amount === booking.estimatedFare 
-          ? 'SEARCHING_DRIVER' 
-          : booking.bookingStatus
+        bookingStatus: newBookingStatus
       },
       { session, new: true }
     );
@@ -251,11 +271,20 @@ export const processCashPayment = async (req, res) => {
       });
     }
 
+    // Check if trip is completed
+    if (booking.bookingStatus !== 'TRIP_COMPLETED') {
+      return res.status(400).json({
+        success: false,
+        message: 'Trip is not completed yet'
+      });
+    }
+
     // Create payment record
+    const paymentAmount = booking.finalFare || booking.estimatedFare;
     const payment = new Payment({
       bookingId,
       userId,
-      amount: booking.estimatedFare,
+      amount: paymentAmount,
       paymentMethod: 'CASH',
       paymentType: 'FULL',
       paymentStatus: 'PENDING', // Will be completed after trip
@@ -263,12 +292,25 @@ export const processCashPayment = async (req, res) => {
     });
     await payment.save({ session });
 
-    await session.commitTransaction();
+    // Update booking payment status to PAYMENT_DONE
+    await Booking.findByIdAndUpdate(
+      bookingId,
+      {
+        paymentStatus: 'PAID',
+        bookingStatus: 'PAYMENT_DONE'
+      },
+      { session }
+    );
+
+    await session.commitTransaction(); 
 
     res.json({
       success: true,
-      message: 'Cash payment recorded',
-      data: payment
+      message: 'Cash payment confirmed successfully',
+      data: {
+        payment,
+        bookingStatus: 'PAYMENT_DONE'
+      }
     });
   } catch (error) {
     await session.abortTransaction();

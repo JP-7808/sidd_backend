@@ -294,6 +294,7 @@ export const approveRider = async (req, res) => {
         { 
           approvalStatus: 'APPROVED',
           isApproved: true,
+          isAvailable: true,
           approvedAt: new Date()
         }
       );

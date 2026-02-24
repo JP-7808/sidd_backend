@@ -119,9 +119,18 @@ const bookingSchema = new mongoose.Schema({
 
   // Distance & Fare
   distanceKm: { type: Number, required: true, min: 0 },
+  actualDistanceKm: Number,
   estimatedDuration: Number,
   estimatedFare: { type: Number, required: true, min: 0 },
   finalFare: Number,
+  additionalCharges: { type: Number, default: 0 },
+  additionalChargesBreakdown: {
+    tollCharges: { type: Number, default: 0 },
+    parkingCharges: { type: Number, default: 0 },
+    nightCharges: { type: Number, default: 0 },
+    otherCharges: { type: Number, default: 0 },
+    description: String
+  },
   adminCommissionAmount: Number,
   riderEarning: Number,
 
@@ -142,11 +151,24 @@ const bookingSchema = new mongoose.Schema({
   cancellationReason: String,
   cancellationCharge: { type: Number, default: 0 },
 
-  // Vehicle Type
+   // Vehicle Type
   vehicleType: {
     type: String,
     enum: ["HATCHBACK", "SEDAN", "SUV", "PREMIUM"],
     required: true
+  },
+
+  // Trip Type (ONE_WAY or ROUND_TRIP)
+  tripType: {
+    type: String,
+    enum: ["ONE_WAY", "ROUND_TRIP"],
+    default: "ONE_WAY"
+  },
+
+  // Number of days for round trip
+  days: {
+    type: Number,
+    default: 1
   },
 
   // Metadata
@@ -156,6 +178,14 @@ const bookingSchema = new mongoose.Schema({
   // Retry attempts for broadcasting
   broadcastRetryCount: { type: Number, default: 0 },
   lastBroadcastedAt: Date,
+
+  // User Rating
+  userRating: { type: Number, min: 1, max: 5 },
+  userReview: { type: String, default: '' },
+
+  // Rider Rating (if rider rates user)
+  riderRating: { type: Number, min: 1, max: 5 },
+  riderReview: { type: String, default: '' },
 
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }

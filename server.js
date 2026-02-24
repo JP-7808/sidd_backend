@@ -37,7 +37,7 @@ const server = http.createServer(app);
 // Socket.IO setup for Rapido-style real-time communication
 const io = new Server(server, {
   cors: {
-    origin: ["http://localhost:3000", "http://localhost:5173", process.env.FRONTEND_URL, "https://pariyatan.com", "https://www.pariyatan.com"].filter(Boolean),
+    origin: ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174", process.env.FRONTEND_URL, "https://pariyatan.com", "https://www.pariyatan.com"].filter(Boolean),
     credentials: true,
     methods: ["GET", "POST"]
   },
@@ -80,6 +80,23 @@ io.on('connection', (socket) => {
       console.log(`✅ Updated rider ${riderId} socketId in database`);
     } catch (error) {
       console.error('❌ Error updating rider socketId:', error);
+    }
+  });
+
+  // User joins booking room for real-time updates
+  socket.on('join-booking', async (bookingId) => {
+    try {
+      // Get booking to find userId
+      const Booking = (await import('./models/Booking.js')).default;
+      const booking = await Booking.findById(bookingId).select('userId');
+      
+      if (booking && booking.userId) {
+        const userRoom = `user-${booking.userId}`;
+        socket.join(userRoom);
+        console.log(`✅ User joined booking room: ${bookingId} (user room: ${userRoom})`);
+      }
+    } catch (error) {
+      console.error('❌ Error joining booking room:', error);
     }
   });
 
@@ -249,6 +266,7 @@ app.use(cors({
   origin: [
     process.env.FRONTEND_URL,
     "http://localhost:5173",
+    "http://localhost:5174",
     "https://pariyatan.com",
     "https://www.pariyatan.com"
   ],

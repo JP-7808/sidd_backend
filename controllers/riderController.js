@@ -997,13 +997,20 @@ export const startRide = async (req, res) => {
     const { otp } = req.body;
     const riderId = req.user._id;
 
-    console.log(`Rider ${riderId} starting ride ${bookingId} with OTP: ${otp}`);
-
     // 1. Find the booking
     const booking = await Booking.findOne({
       _id: bookingId,
       riderId
     }).session(session);
+
+    console.log(`Looking for booking: ${bookingId} with riderId: ${riderId}`);
+    console.log(`Booking found:`, booking ? { 
+      id: booking._id, 
+      status: booking.bookingStatus, 
+      otp: booking.otp, 
+      riderId: booking.riderId,
+      hasOtp: !!booking.otp
+    } : 'NOT FOUND');
 
     if (!booking) {
       await session.abortTransaction();
@@ -1014,6 +1021,7 @@ export const startRide = async (req, res) => {
     }
 
     // 2. Check if booking is in correct state to start
+    console.log(`Current booking status: ${booking.bookingStatus}`);
     if (!['DRIVER_ASSIGNED', 'DRIVER_ARRIVED'].includes(booking.bookingStatus)) {
       await session.abortTransaction();
       return res.status(400).json({
@@ -1031,9 +1039,24 @@ export const startRide = async (req, res) => {
       });
     }
 
-    // Convert both to string for comparison
-    const dbOtp = booking.otp.toString();
-    const requestOtp = otp.toString();
+    console.log(`Rider ${riderId} starting ride ${bookingId} with OTP: "${otp}"`);
+    console.log(`Booking OTP from DB: "${booking.otp}" (type: ${typeof booking.otp})`);
+    console.log(`Input OTP: "${otp}" (type: ${typeof otp})`);
+    
+    if (!booking.otp) {
+      console.error('❌ CRITICAL: Booking has no OTP stored!');
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'Booking has no OTP. Please contact support.'
+      });
+    }
+    
+    // Convert both to string for comparison (trim to handle whitespace issues)
+    const dbOtp = booking.otp.toString().trim();
+    const requestOtp = otp.toString().trim();
+
+    console.log(`Comparing: "${dbOtp}" === "${requestOtp}" = ${dbOtp === requestOtp}`);
 
     if (dbOtp !== requestOtp) {
       await session.abortTransaction();
@@ -1045,15 +1068,19 @@ export const startRide = async (req, res) => {
 
     // 4. Check OTP expiry (allow 5-minute grace period)
     const now = new Date();
-    const otpExpiry = new Date(booking.otpExpiresAt);
-    const timeDiffMinutes = (otpExpiry - now) / (1000 * 60);
+    if (booking.otpExpiresAt) {
+      const otpExpiry = new Date(booking.otpExpiresAt);
+      const timeDiffMinutes = (otpExpiry - now) / (1000 * 60);
 
-    if (timeDiffMinutes < -5) {
-      await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        message: 'OTP has expired. Please request a new OTP from customer.'
-      });
+      if (timeDiffMinutes < -5) {
+        await session.abortTransaction();
+        return res.status(400).json({
+          success: false,
+          message: 'OTP has expired. Please request a new OTP from customer.'
+        });
+      }
+    } else {
+      console.log('OTP expiry not set, skipping expiry check');
     }
 
     // 5. Update booking status
@@ -1176,19 +1203,27 @@ export const completeRide = async (req, res) => {
 
   try {
     const { bookingId } = req.params;
-    const { finalDistance, additionalCharges = 0 } = req.body;
+    const { finalDistance, additionalCharges = 0, additionalChargesBreakdown = {} } = req.body;
     const riderId = req.user._id;
 
     console.log('========== COMPLETE RIDE ==========');
     console.log(`Rider ${riderId} completing ride ${bookingId}`);
-    console.log('Request data:', { finalDistance, additionalCharges });
+    console.log('Request data:', { finalDistance, additionalCharges, additionalChargesBreakdown });
 
     // 1. Find the booking
     const booking = await Booking.findOne({
       _id: bookingId,
-      riderId,
-      bookingStatus: 'TRIP_STARTED'
+      riderId
     }).session(session);
+
+    console.log(`Looking for booking: ${bookingId} with riderId: ${riderId}`);
+    console.log(`Booking found:`, booking ? { 
+      id: booking._id, 
+      status: booking.bookingStatus, 
+      otp: booking.otp, 
+      riderId: booking.riderId,
+      hasOtp: !!booking.otp
+    } : 'NOT FOUND');
 
     if (!booking) {
       await session.abortTransaction();
@@ -1273,11 +1308,20 @@ export const completeRide = async (req, res) => {
     booking.bookingStatus = 'TRIP_COMPLETED';
     booking.rideEndTime = new Date();
     booking.finalFare = Math.round(finalFare);
+    booking.additionalCharges = parseFloat(additionalCharges) || 0;
+    booking.additionalChargesBreakdown = {
+      tollCharges: parseFloat(additionalChargesBreakdown.tollCharges) || 0,
+      parkingCharges: parseFloat(additionalChargesBreakdown.parkingCharges) || 0,
+      nightCharges: parseFloat(additionalChargesBreakdown.nightCharges) || 0,
+      otherCharges: parseFloat(additionalChargesBreakdown.otherCharges) || 0,
+      description: additionalChargesBreakdown.description || ''
+    };
     booking.adminCommissionAmount = Math.round(adminCommission);
     booking.riderEarning = Math.round(riderEarning);
     
     if (finalDistance && finalDistance > 0) {
       booking.distanceKm = finalDistance;
+      booking.actualDistanceKm = finalDistance;
     }
     
     await booking.save({ session });
@@ -1490,11 +1534,21 @@ export const completeRide = async (req, res) => {
     // 12. Emit socket events
     const io = req.app.get('io');
     if (io) {
+      // Notify user
       io.to(`user-${booking.userId}`).emit('ride-completed', {
         bookingId: booking._id,
         finalFare: booking.finalFare,
         riderEarning: booking.riderEarning,
         paymentMethod: booking.paymentMethod
+      });
+
+      // Notify rider about ride completion and earnings
+      io.to(`rider-${riderId}`).emit('ride-completed', {
+        bookingId: booking._id,
+        finalFare: booking.finalFare,
+        riderEarning: booking.riderEarning,
+        paymentMethod: booking.paymentMethod,
+        completedAt: new Date()
       });
     }
 
@@ -1855,11 +1909,16 @@ export const getRiderEarnings = async (req, res) => {
 
     const query = { riderId };
 
-    // Filter by date range
+    // Filter by date range - handle both ISO and YYYY-MM-DD format
     if (startDate && endDate) {
+      const start = new Date(startDate);
+      start.setHours(0, 0, 0, 0);
+      const end = new Date(endDate);
+      end.setHours(23, 59, 59, 999);
+      
       query.createdAt = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate),
+        $gte: start,
+        $lte: end,
       };
     }
 

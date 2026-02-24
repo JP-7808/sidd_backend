@@ -148,6 +148,14 @@ const riderSchema = new mongoose.Schema({
     default: 0
   },
   
+  ratings: [{
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    bookingId: { type: mongoose.Schema.Types.ObjectId, ref: 'Booking' },
+    rating: { type: Number, min: 1, max: 5 },
+    comment: String,
+    createdAt: { type: Date, default: Date.now }
+  }],
+  
   completedRides: {
     type: Number,
     default: 0

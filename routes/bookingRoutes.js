@@ -23,7 +23,8 @@ import {
   completeTrip,
   cancelBooking,
   updateLiveLocation,
-  generateInvoice
+  generateInvoice,
+  rateBooking
 } from '../controllers/bookingController.js';
 
 const router = express.Router();
@@ -38,6 +39,7 @@ router.use(authenticate);
 router.post('/', isUser, createBooking);
 router.get('/user/my-bookings', isUser, getUserBookings);
 router.get('/:id/invoice', generateInvoice);
+router.post('/:id/rate', isUser, rateBooking);
 
 // Rider routes
 router.get('/rider/my-bookings', isRider, getRiderBookings);
