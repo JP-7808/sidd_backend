@@ -338,6 +338,9 @@ const startServer = async () => {
     // Create default admin if not exists
     await createDefaultAdmin();
     
+    // Seed default pricing (only admin can change via dashboard)
+    await seedDefaultPricing();
+    
     server.listen(PORT, () => {
       console.log(`✅ Server running on port ${PORT}`);
       console.log(`✅ Socket.IO server ready for Rapido-style booking`);
@@ -382,6 +385,32 @@ const createDefaultAdmin = async () => {
     }
   } catch (error) {
     console.error('Error creating default admin:', error);
+  }
+};
+
+// Seed default pricing (only admin can change via dashboard)
+const seedDefaultPricing = async () => {
+  try {
+    const Pricing = (await import('./models/Pricing.js')).default;
+    
+    const defaultPricing = [
+      { cabType: 'HATCHBACK', baseFare: 40, pricePerKm: 10, adminCommissionPercent: 20, isActive: true },
+      { cabType: 'SEDAN', baseFare: 50, pricePerKm: 12, adminCommissionPercent: 20, isActive: true },
+      { cabType: 'SUV', baseFare: 70, pricePerKm: 18, adminCommissionPercent: 20, isActive: true },
+      { cabType: 'PREMIUM', baseFare: 100, pricePerKm: 25, adminCommissionPercent: 20, isActive: true },
+      { cabType: 'LUXURY', baseFare: 150, pricePerKm: 35, adminCommissionPercent: 20, isActive: true }
+    ];
+    
+    for (const price of defaultPricing) {
+      await Pricing.findOneAndUpdate(
+        { cabType: price.cabType },
+        price,
+        { upsert: true, new: true }
+      );
+    }
+    console.log('✅ Default pricing seeded');
+  } catch (error) {
+    console.error('Error seeding pricing:', error);
   }
 };
 

@@ -82,7 +82,7 @@ export const calculateFareDetails = async (distance, vehicleType) => {
     }
 
     const baseFare = pricing.baseFare || 50;
-    const pricePerKm = pricing.pricePerKm || 10;
+    const pricePerKm = pricing.pricePerKm || 12;
     const commissionPercent = pricing.adminCommissionPercent || 20;
 
     const totalFare = Math.round(baseFare + (distance * pricePerKm));

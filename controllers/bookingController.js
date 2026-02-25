@@ -110,7 +110,7 @@ export const calculateFareController = async (req, res) => {
     if (!pricing) {
       console.log('No pricing found for vehicle type:', vehicleType, 'using defaults');
       pricing = {
-        baseFare: 500,
+        baseFare: 50,
         pricePerKm: 12,
         driverAllowancePerDay: 200
       };

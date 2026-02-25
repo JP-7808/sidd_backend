@@ -2613,7 +2613,10 @@ export const getActiveBooking = async (req, res) => {
       bookingStatus: { 
         $in: ['DRIVER_ASSIGNED', 'DRIVER_ARRIVED', 'TRIP_STARTED'] 
       }
-    }).populate('userId', 'name phone email');
+    })
+    .select('tripType paymentMethod distanceKm billableKm estimatedFare pickup drop days vehicleType bookingStatus')
+    .populate('userId', 'name phone email')
+    .populate('cabId', 'cabNumber cabModel cabType');
 
     res.json({
       success: true,

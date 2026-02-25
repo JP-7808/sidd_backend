@@ -9,9 +9,9 @@ export const generateOTP = () => {
 // Calculate fare based on distance and vehicle type
 export const calculateFare = (distance, vehicleType) => {
   const baseFares = {
-    HATCHBACK: 50,
-    SEDAN: 60,
-    SUV: 80,
+    HATCHBACK: 40,
+    SEDAN: 50,
+    SUV: 70,
     PREMIUM: 100,
     LUXURY: 150
   };
@@ -24,7 +24,7 @@ export const calculateFare = (distance, vehicleType) => {
     LUXURY: 25
   };
   
-  const baseFare = baseFares[vehicleType] || 60;
+  const baseFare = baseFares[vehicleType] || 50;
   const perKmRate = perKmRates[vehicleType] || 12;
   
   return Math.round(baseFare + (distance * perKmRate));
