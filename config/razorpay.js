@@ -1,4 +1,5 @@
 // config/razorpay.js
+import crypto from 'crypto'; 
 import Razorpay from 'razorpay';
 import dotenv from 'dotenv';
 
@@ -44,7 +45,7 @@ export const createRazorpayOrder = async (amount, currency = 'INR', receipt, not
  * @returns {boolean} Verification result
  */
 export const verifyPaymentSignature = (orderId, paymentId, signature) => {
-  const crypto = require('crypto');
+  // const crypto = require('crypto');
   
   const body = orderId + '|' + paymentId;
   const expectedSignature = crypto

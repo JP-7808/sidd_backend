@@ -34,16 +34,25 @@ export const createOrder = async (req, res) => {
     }
 
     // Check if payment already exists
-    const existingPayment = await Payment.findOne({
-      bookingId,
-      paymentStatus: { $in: ['SUCCESS', 'PENDING'] }
-    });
+    const existingPayment = await Payment.findOne({ bookingId });
 
-    if (existingPayment && existingPayment.paymentStatus === 'SUCCESS') {
-      return res.status(400).json({
-        success: false,
-        message: 'Payment already completed for this booking'
-      });
+    if (existingPayment) {
+      // If payment is SUCCESS and has a Razorpay payment ID → truly paid, block
+      if (existingPayment.paymentStatus === 'SUCCESS' && existingPayment.razorpayPaymentId) {
+        return res.status(400).json({
+          success: false,
+          message: 'Payment already completed for this booking'
+        });
+      }
+
+      // If payment is SUCCESS but has no Razorpay payment ID → erroneous state, reset to PENDING
+      if (existingPayment.paymentStatus === 'SUCCESS' && !existingPayment.razorpayPaymentId) {
+        existingPayment.paymentStatus = 'PENDING';
+        existingPayment.razorpayOrderId = null;
+        existingPayment.razorpayPaymentId = null;
+        existingPayment.razorpaySignature = null;
+        await existingPayment.save();
+      }
     }
 
     // Create Razorpay order
@@ -279,20 +288,30 @@ export const processCashPayment = async (req, res) => {
       });
     }
 
-    // Create payment record
+    // Find existing payment or create new
+    let payment = await Payment.findOne({ bookingId }).session(session);
     const paymentAmount = booking.finalFare || booking.estimatedFare;
-    const payment = new Payment({
-      bookingId,
-      userId,
-      amount: paymentAmount,
-      paymentMethod: 'CASH',
-      paymentType: 'FULL',
-      paymentStatus: 'PENDING', // Will be completed after trip
-      description: `Cash payment for booking ${bookingId}`
-    });
+
+    if (!payment) {
+      payment = new Payment({
+        bookingId,
+        userId,
+        amount: paymentAmount,
+        paymentMethod: 'CASH',
+        paymentType: 'FULL',
+        paymentStatus: 'PENDING_SETTLEMENT',
+        description: `Cash payment for booking ${bookingId}`
+      });
+    } else {
+      // Update existing payment
+      payment.amount = paymentAmount;
+      payment.paymentStatus = 'PENDING_SETTLEMENT';
+      payment.updatedAt = new Date();
+    }
+
     await payment.save({ session });
 
-    // Update booking payment status to PAYMENT_DONE
+    // Update booking payment status
     await Booking.findByIdAndUpdate(
       bookingId,
       {
@@ -302,7 +321,7 @@ export const processCashPayment = async (req, res) => {
       { session }
     );
 
-    await session.commitTransaction(); 
+    await session.commitTransaction();
 
     res.json({
       success: true,
