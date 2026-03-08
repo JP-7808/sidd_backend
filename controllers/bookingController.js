@@ -190,21 +190,17 @@ export const calculateFareController = async (req, res) => {
       };
 
     } else if (tripType === 'LOCAL_RENTAL') {
-      // Local Rental - Hourly/Daily rate
-      const rentalHours = tripHours || minHoursLocal;
-      billableHours = rentalHours;
-      
-      // Local rental fare: base for first hour + hourly rate for additional hours + driver charges
-      const additionalHours = Math.max(0, rentalHours - 1); // First hour included in base
-      estimatedFare = baseFare + (additionalHours * hourlyRate) + driverChargesPerDay;
-      fareBreakdown = {
-        baseFare: baseFare,
-        distanceFare: additionalHours * hourlyRate,
-        driverCharges: driverChargesPerDay,
-        total: estimatedFare
-      };
-
-    } else {
+  // Local Rental - Simple distance-based fare 
+  estimatedFare = baseFare + (distanceKm * pricePerKm);
+  fareBreakdown = {
+    baseFare: baseFare,
+    distanceFare: distanceKm * pricePerKm,
+    driverCharges: 0,          
+    total: estimatedFare
+  };
+  // Keep billableHours only for display (not used in fare)
+  billableHours = tripHours || minHoursLocal;
+} else {
       // Default to ONE_WAY if unknown trip type
       estimatedFare = baseFare + (distanceKm * pricePerKm);
       fareBreakdown = {
